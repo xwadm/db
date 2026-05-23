@@ -1,0 +1,2304 @@
+# Changelog
+
+All notable changes to SpinDB will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.50.4] - 2026-05-17
+
+### Fixed
+
+- **ClickHouse `waitForReady` now detects auth-required as "server up" (BUG-18 from `~/dev/qa-sweep-bug-tracker.md`).** The readiness probe at `engines/clickhouse/index.ts:waitForReady` spawned `clickhouse client --query "SELECT 1"` without `--user/--password`. Once the ClickHouse user has a password set (which layerbase-cloud's `setup-database.sh` does on first provision by editing `users.xml`), every subsequent restart's unauthenticated probe returned exit code 4 — and `waitForReady` blindly looped until the full 240s timeout fired and fell back to "treating as started". On layerbase-cloud's wake codepath, three chained spindb starts (cloud-side + setup-database.sh's universal restart + setup-database.sh's ClickHouse case-block restart) each burned that 240s, adding ~12 minutes of wall-clock to every ClickHouse hibernate→wake cycle. Fix: capture the probe's stderr, and if it matches the well-known auth-failure patterns (`Authentication failed`, `password is incorrect`, `UNKNOWN_USER`, `AUTHENTICATION_FAILED`, `there is no user with such name`), trust the response as proof the server is listening and return ready immediately. End-to-end impact: ClickHouse wake on layerbase-cloud drops from ~12 minutes to ~30 seconds.
+
+## [0.50.3] - 2026-05-16
+
+### Fixed
+
+- **TypeDB user password rotation against an existing user always failed (BUG-13 from `~/dev/qa-sweep-bug-tracker.md`).** `engines/typedb/index.ts:1234` invoked `user password-update <name> <pw>` via the `--command` flag of `typedb_console_bin`. The TypeDB 3.x console registers the subcommand as `update-password` (verified against `typedb/typedb-console` `main.rs` from 3.8.0 through 3.10.1), so the call surfaced as `Unrecognised 'user' subcommand: 'password-update …'` and the close handler bubbled `Failed to update user password`. The `createUser` flow's `user create` → on-"already exists" → password-update fallback was therefore broken for every admin-password rotation, which in layerbase-cloud surfaces as a 401 AUT1 on the very first query (cloud's stored credential is the rotated one, but TypeDB still has `admin/password`). Fix: swap the subcommand to the canonical `update-password`.
+
+## [0.50.2] - 2026-05-16
+
+### Fixed
+
+- **TigerBeetle integration test flakiness (~25% failure rate on CI).** Two distinct races in `engines/tigerbeetle/index.ts` were causing intermittent CI failures on macOS arm64, macOS x64, and Windows x64 runners (BUG-7 from `~/dev/qa-sweep-bug-tracker.md`). (1) **Format timeout race**: `tigerbeetle format` allocates ~1.06 GiB on disk even with `--development`; the old 30s `execFileSync` budget was too tight for cold CI disks, surfacing as `ETIMEDOUT` during format. (2) **Start readiness race + unconditional kill**: `waitForReady` used `portManager.isPortAvailable`, which flips false the moment anything binds the port (including a half-bound socket not yet accepting); follow-on TCP connects raced and observed `ECONNREFUSED`. When the probe timed out the code unconditionally killed `proc.pid`, terminating actually-alive daemons. Fix: format runs via async `spawnAsync` with a 120s budget + `waitForDataFileReady` poll; start retries the data-file existence check, uses real TCP connect probing with port-bound fallback (60s wait budget), and — mirroring spindb 0.50.1's ClickHouse PID-race fix — treats "port has a listener" as ready when the probe times out instead of killing the daemon. New `tests/unit/tigerbeetle-startup-race.test.ts` adds 7 regression tests covering both races.
+
+### Changed
+
+- **`hostdb` dep bumped: `0.31.0` → `0.31.1` (exact pin).** `hostdb@0.31.1` moves `tsx` from `dependencies` to `devDependencies` (no API surface change). End users installing spindb no longer get a transitive `tsx` install, which removes the platform-specific `@esbuild/<platform>` binaries that previously broke electron-builder's universal-macOS merge in layerbase-desktop. Spindb's compiled `dist/` doesn't need tsx at runtime.
+
+## [0.50.1] - 2026-05-16
+
+### Fixed
+
+- **ClickHouse PID-file race in `engine.start()`.** Previously the PID file was written only after `waitForReady` succeeded; on cold-start timeouts or `findProcessByPort` hiccups the daemon was left running but PID-fileless, which downstream consumers (notably layerbase-cloud's `health-monitor` task that runs `spindb list --json` every 60s and derives status from PID-file existence) interpreted as `stopped`. That stuck ClickHouse cloud databases in a Stopped → Start → Stopped loop they couldn't escape. Fixed by introducing a `writePidFromPort(port, pidFile, options?)` helper that scrapes the listening port and writes the PID file independently of `waitForReady` — invoked both before AND after `waitForReady` for belt-and-suspenders. If `waitForReady` times out but the PID file was successfully written, treat the daemon as started (it's bound and the readiness handshake will retry on the next client query). Only throw `"failed to start within timeout"` when neither signal saw the daemon. Surfaced by the 2026-05-16 prod QA sweep; tracked as BUG-2 in `~/dev/qa-sweep-bug-tracker.md`.
+
+### Tests
+
+- New `tests/unit/clickhouse-pid-write.test.ts` with 3 regression tests covering the PID-write helper (port-bound → file written, no listener → no file + returns false, bounded retry honors maxAttempts/intervalMs).
+
+## [0.50.0] - 2026-05-15
+
+### Changed — hostdb is now an npm dependency
+
+SpinDB no longer hand-maintains 21 `engines/<X>/version-maps.ts` MAP files. They're now thin wrappers over the `hostdb` npm package (pinned exactly at `0.31.0`). To get new database versions, bump the `hostdb` dep — the wrappers rebuild automatically.
+
+- **Wrapper pattern.** `engines/<X>/version-maps.ts` exports (`<ENGINE>_VERSION_MAP`, `SUPPORTED_MAJOR_VERSIONS`, `getFullVersion`, `normalizeVersion`) preserved; values now sourced from hostdb's resolver at module-load time.
+- **Offline metadata.** `core/hostdb-metadata.ts` reads `databases.json` / `downloads.json` from the bundled `hostdb` package — no runtime network call for registry metadata. Binary downloads still hit R2.
+- **Eager version resolution at create.** `spindb create postgresql 18` now resolves to the full version (`18.4.0`) via hostdb BEFORE writing `container.json`. New containers persist the full version and are immune to future drift.
+- **Auto-migrate on start.** Legacy containers with shorthand `version: '17'` are auto-pinned to the full version on next `spindb start`. One-time migration; silent thereafter.
+
+### Migration
+
+If you have existing containers created by spindb <0.50.0, no action required — they self-pin on next start. To inspect or batch-migrate explicitly: `spindb doctor --dry-run` shows containers that will migrate; `spindb doctor --fix` performs the migration interactively.
+
+### Removed
+
+- `config/engines.json` no longer carries `supportedVersions` / `defaultVersion` / `versionPlatforms` (those fields drifted from hostdb's truth). The JSON output of `spindb engines supported --json` preserves the same shape, enriched at output time from hostdb.
+- `config/engine-defaults.ts:latestVersion` deleted. Callers now read `engine.supportedVersions[0]` (sourced from the hostdb-driven wrapper).
+- `filterEnginesByPlatform` in `config/engines-registry.ts` removed (only used by deleted `tests/unit/engines-registry.test.ts`).
+
+## [0.49.0] - 2026-05-15
+
+### Changed
+
+- **Tracked latest hostdb engine releases.** Version maps repointed to the patches now live on `registry.layerbase.host`:
+  - SQLite: `3.51.2` → `3.53.1`
+  - Meilisearch: `1.33.1` → `1.43.1`
+  - DuckDB: `1.4.3` → `1.4.4`
+  - Redis: `7.4.7` → `7.4.9` (8.4 line stays at 8.4.0)
+  - Valkey: `8.0.6` → `8.0.9`, `9.0.1` → `9.0.4`
+  - MariaDB: `10.11.15` → `10.11.16`, `11.4.5` → `11.4.10`, `11.8.5` → `11.8.6`
+  - MongoDB: `7.0.28` → `7.0.34`, `8.0.17` → `8.0.23`, `8.2.3` → `8.2.9`
+  - MySQL: `8.4.3` → `8.4.9`
+  - PostgreSQL: `15.15` → `15.18`, `16.11` → `16.14`, `17.7` → `17.10`, `18.1` → `18.4`
+- Old patch versions remain in each engine's `VERSION_MAP` so previously-provisioned containers keep resolving to the binary they were created with. The 1-part and 2-part major.minor keys now point at the new defaults; the cloud universal image consumes them automatically on its next rebuild.
+
+## [0.48.1] - 2026-04-20
+
+### Fixed
+
+- **`spindb which` picks a stopped container when multiple share a port** — When two or more containers were registered on the same port (e.g., one stopped from an earlier project and one currently running an app's database), `spindb which --url <DATABASE_URL>` could return either, because the resolver was a naive `containers.find(c => c.port === targetPort)` with no preference for running state or which container actually hosted the requested database. Scripts downstream (e.g., `pnpm db:clone` tooling) then had to self-heal the wrong answer. Fixed by ranking candidates: running containers score higher than stopped, and containers that host the database named in the URL path score higher still. The first candidate wins ties so behavior stays deterministic.
+
+### Added
+
+- **URL-path database parsing in `spindb which`** — `parseConnectionUrl` now extracts the database name from the URL pathname (e.g., `postgresql://localhost:5433/offlabelinsight` → `offlabelinsight`) and passes it through to the candidate ranker as `targetDatabase`. Previously the pathname was discarded.
+- **`selectContainerForWhich` helper** — The ranking logic is extracted from the command action into a pure, testable helper exported from `cli/commands/which.ts`. Covered by `tests/unit/which-select.test.ts` (8 cases including the original regression: running vs stopped on the same port, running+hosts-database preference, and stable tiebreakers).
+
+## [0.48.0] - 2026-04-20
+
+### Fixed
+
+- **`spindb pull` no longer requires Homebrew for PostgreSQL version mismatches** — When pulling from a remote PostgreSQL server whose major version is newer than the currently-registered `pg_dump`, the resolver would only look for compatible client tools under `/opt/homebrew/opt/postgresql@<major>/bin` and `/usr/lib/postgresql/<major>/bin`. If the user hadn't run `brew install postgresql@18` (or the APT equivalent), the pull failed with an install-via-homebrew error message — even though spindb had already downloaded the matching binaries into `~/.spindb/bin/postgresql-18.1.0-*`. `pg_dump`, `pg_restore`, `psql`, and `pg_basebackup` are now resolved exclusively from spindb's bundled binary cache.
+
+### Changed
+
+- **Removed system package manager fallback for PostgreSQL client tools.** spindb is responsible for every database binary it uses — the Homebrew/APT/YUM detection paths were legacy scaffolding from before hostdb shipped complete PostgreSQL packages. Renamed `core/homebrew-version-manager.ts` → `core/pg-binary-resolver.ts` and reduced it to only scan `~/.spindb/bin/` via `paths.findInstalledBinaryForMajor`. Deleted `isHomebrewAvailable`, `getCurrentLinkedVersion`, `switchHomebrewVersion`, and the Homebrew/APT probing inside `detectInstalledPostgres` / `getDirectBinaryPath`.
+- **`DumpCompatibilityResult` shape.** `requiredAction` enum tightened from `'none' | 'use_direct_path' | 'switch_homebrew' | 'install'` to `'none' | 'use_bundled' | 'download'`, and `switchTarget` renamed to `targetMajor`. The `switch_homebrew` branch in `getCompatiblePgDumpPath` (which would call `brew link --overwrite postgresql@X`) is gone.
+- **Error message remediation hints** — Every PostgreSQL and FerretDB code path that previously surfaced `brew install postgresql@X` / `apt install postgresql-client` now points at `spindb engines download postgresql <major>` instead.
+
+### Added
+
+- **`tests/unit/pg-binary-resolver.test.ts`** — Unit coverage for `getBundledBinaryPath` and `findCompatibleVersion`, plus a source-grep regression guard that fails compilation if any PostgreSQL code path reintroduces a `brew install postgresql` or `apt install postgresql-client` hint.
+- **CLAUDE.md gotcha** — Documented the bundled-only invariant for PostgreSQL client tools so future work doesn't silently reintroduce the system-package-manager fallback.
+
+## [0.47.18] - 2026-04-15
+
+### Fixed
+
+- **InfluxDB Windows DLL loading** — Fixed InfluxDB failing to start on Windows with exit code 0xC0000135 (STATUS_DLL_NOT_FOUND). The `influxdb3.exe` binary has a load-time dependency on `python313.dll` (bundled PYO3 runtime) which lives in the co-located `python/` subdirectory, but Windows only searches the application directory by default. Now adds `python/` to the PATH in the spawn environment for all InfluxDB process launches (start, verify, token creation). Added `getWindowsDllEnv()` to `library-env.ts` and a `getSpawnEnv()` hook to `BaseBinaryManager` for engine-specific library paths.
+
+## [0.47.17] - 2026-04-15
+
+### Improvements
+
+- **InfluxDB Windows DLL diagnostic in CI** — Added diagnostic step to InfluxDB CI jobs that captures DLL dependencies, file layout, and system DLL availability on Windows runners. Investigating exit code 0xC0000135 (STATUS_DLL_NOT_FOUND) on `windows-latest` when cache misses force a fresh binary download from hostdb.
+
+## [0.47.16] - 2026-04-15
+
+### Fixed
+
+- **MySQL/MariaDB host cache poisoning** — Added `--host-cache-size=0` to MySQL and MariaDB start args to disable the host cache. Stale ProxySQL processes from deleted databases could poison MySQL's `performance_schema.host_cache`, causing intermittent connection blocks for all clients on the Docker bridge IP after 100 accumulated handshake errors. Uses `--host-cache-size=0` instead of the deprecated `--skip-host-cache` (removed in MySQL 8.3+).
+
+## [0.47.14] - 2026-04-03
+
+### Fixed
+
+- **Query command JSON output** — `spindb query --json` now outputs the full result object (`{ columns, rows, rowCount, commandTag }`) instead of just the rows array. Consumers like Layerbase Cloud can distinguish SELECT results from write operation confirmations.
+- **PostgreSQL write query parsing** — `parseCSVToQueryResult` now detects PostgreSQL command tags (`INSERT 0 1`, `CREATE TABLE`, `UPDATE 3`, etc.) instead of misinterpreting them as CSV column headers. Affected all PG-wire engines: PostgreSQL, CockroachDB, DuckDB, SQLite, QuestDB.
+
+## [0.47.13] - 2026-04-01
+
+### Fixed
+
+- **MongoDB waitForReady with --auth** — Health check falls back to TCP port probe when `mongosh` fails due to auth requirements, so PID tracking works correctly for auth-enabled instances.
+
+## [0.47.12] - 2026-04-01
+
+### Fixed
+
+- **SurrealDB namespace via CLI** — Added `--namespace` flag to `spindb query`. `executeQuery` now accepts `options.namespace` to override the default container-name-derived namespace. Cloud passes `--namespace default`.
+
+## [0.47.11] - 2026-04-01
+
+### Fixed
+
+- **SurrealDB query uses 'default' namespace** — `executeQuery` now defaults to `'default'` namespace instead of deriving from container name. Cloud environments use `'default'` as the standard namespace.
+
+## [0.47.10] - 2026-03-31
+
+### Fixed
+
+- **SurrealDB start reads saved credentials** — `start()` now reads credentials from the SpinDB credential file (written by cloud setup) instead of hardcoding `root/root`. Falls back to `root/root` for local development when no credential file exists.
+
+## [0.47.9] - 2026-03-31
+
+### Fixed
+
+- **Weaviate start timeout** — Increased `waitForReady` from 90s to 120s for resource-constrained servers (2GB RAM).
+
+## [0.47.8] - 2026-03-31
+
+### Fixed
+
+- **Weaviate RAFT cluster identity** — Use stable `node1` hostname and set `RAFT_BOOTSTRAP_EXPECT=1`, `CLUSTER_ADVERTISE_ADDR`, `RAFT_JOIN`, and `CLUSTER_JOIN` env vars on start. Previously the hostname was `node-{port}` which mismatched the identity from setup-database.sh, causing RAFT to treat restarts as new node joins.
+
+## [0.47.7] - 2026-03-31
+
+### Fixed
+
+- **Weaviate RAFT cleanup on bind address change** — `start()` now tracks the last-used bind address and wipes RAFT state when it changes, preventing startup hangs from stale cluster state.
+- **SurrealDB credential flags on restart** — `--user/--pass` flags are now only passed on first boot (empty data dir). On restart with existing data, the flags are skipped since SurrealDB ignores them anyway and credentials are already persisted in SurrealKV.
+
+## [0.47.6] - 2026-03-31
+
+### Fixed
+
+- **DuckDB create uses container directory** — `spindb create --engine duckdb` now defaults the `.duckdb` file path to the SpinDB container directory instead of the current working directory. Fixes cloud containers where CWD is `/` and the file was created at the wrong location.
+
+## [0.47.5] - 2026-03-31
+
+### Fixed
+
+- **DuckDB initDataDir binary lookup** — `initDataDir` now passes the version to `getDuckDBPath()` so it can locate the downloaded binary. Previously the version was unused (`_version`), causing `requireDuckDBPath()` to fail when no cached path existed (e.g. in cloud containers).
+
+## [0.47.4] - 2026-03-30
+
+### Fixed
+
+- **CouchDB start with external credentials** — Skip admin auth verification during `start()` when no saved credentials exist, preventing 401 failures and account lockout after credentials are changed externally (e.g. cloud setup).
+- **ClickHouse cold start timeout** — Increased health check timeout from 120s to 240s to accommodate cold starts on resource-constrained VMs.
+
+## [0.47.2] - 2026-03-30
+
+### Fixed
+
+- **MongoDB local host normalization** — `listDatabases` now normalizes `0.0.0.0` bind addresses to `127.0.0.1`, consistent with the FerretDB fix in 0.47.1.
+
+## [0.47.3] - 2026-04-01
+
+### Fixed
+
+- **MongoDB executeQuery host handling** — All local `executeQuery` flows now normalize the bind address before calling `buildMongoUri`, preventing `mongosh` from seeing `0.0.0.0` when credentials are enforced and ensuring the stored `.env.spindb` credentials match the requested host.
+
+## [0.47.1] - 2026-03-29
+
+### Fixed
+
+- **PostgreSQL auth-aware database creation** — Restore/setup paths now honor the authenticated username passed into `createDatabase()` instead of always forcing the default superuser.
+- **Redis backup/restore CLI error handling** — Local backup and restore now share the same auth-aware `redis-cli` invocation, reject signal-terminated runs, and avoid misclassifying valid data output as auth failures.
+- **MariaDB restore credential fallback** — Corrupt or unreadable saved credential files no longer abort restore when explicit credentials were provided.
+- **FerretDB local host normalization** — Local query/restore flows now normalize `0.0.0.0` to `127.0.0.1` consistently, and archive restore fallback no longer wrongly assumes gzip compression.
+- **Meilisearch auth test cleanup** — Auth integration test container names now consistently include `-test`, so shared cleanup checks can detect leaks reliably.
+
+## [0.47.0] - 2026-03-29
+
+### Added
+
+- **Secure local CockroachDB mode** — Local CockroachDB containers now generate per-container TLS certificates, start with `--certs-dir`, use root client-cert auth for internal admin flows, and support password-authenticated local backup/restore.
+- **Focused auth-backed backup/restore coverage across the remaining auth-sensitive engines** — CockroachDB, QuestDB, TypeDB, InfluxDB, Meilisearch, Weaviate, Qdrant, and LibSQL now have explicit verification instead of relying on anonymous localhost assumptions.
+- **SurrealDB auth regression coverage** — Added unit tests for explicit `authLevel` handling and quote-safe backup sanitization.
+- **First-class remote origin metadata** — Linked remotes now persist `remote.origin` as either `external` or `layerbase-cloud`, so cloud-linked databases can be distinguished from generic third-party remotes without relying only on provider-name heuristics.
+
+### Changed
+
+- **FerretDB backups are now Mongo-native** — New FerretDB backups use Mongo-style archive/BSON semantics instead of PostgreSQL dump formats. Restore remains backward-compatible with older artifacts.
+- **SurrealDB non-root connection strings must be explicit** — Non-root `surrealdb://` URLs now require `?authLevel=namespace|database` instead of guessing `database`.
+- **InfluxDB local auth now persists admin tokens** — Local auth-backed startup and restore now rely on `admin-token.json`, not ad hoc token creation at query time.
+- **Meilisearch local auth now persists a master key** — `createUser()` configures a stable `master.key` so local auth-backed backup/restore can restart cleanly.
+
+### Fixed
+
+- **Auth-backed local backup/restore** — PostgreSQL, MySQL, MariaDB, MongoDB, FerretDB, Redis, Valkey, CouchDB, SurrealDB, ClickHouse, QuestDB, TypeDB, InfluxDB, Meilisearch, Weaviate, Qdrant, LibSQL, and CockroachDB now reuse saved credentials instead of assuming passwordless localhost access.
+- **FerretDB restore robustness** — Namespace remapping now uses documented `mongorestore` placeholders, and directory scans fail safely instead of throwing on unreadable backups.
+- **Linked-container toggle feedback in the TUI** — Pressing `Shift+Tab` on a linked database in the containers menu now keeps the "managed externally" warning visible across the redraw instead of flashing and disappearing.
+- **Cloud-vs-external linked container display** — `spindb list`, `spindb info`, and the interactive containers menu now show Layerbase Cloud links distinctly from generic linked remotes while staying backward-compatible with older configs that only have `provider`.
+- **MariaDB and Valkey shell safety** — Credential-bearing local admin calls now use argv-based process execution rather than interpolated shell strings.
+- **InfluxDB token parsing errors** — Malformed or unreadable persisted admin token files now raise clear errors that include the file path.
+- **SurrealDB backup sanitization** — Auth-defining statements are stripped without breaking on semicolons inside quoted values.
+
+## [0.46.5] - 2026-03-26
+
+### Fixed
+
+- **Redis/Valkey managed auth** — `redis-cli` no longer passes `--user default` for password-only local and linked connections, fixing `NOAUTH Authentication required.` against Layerbase-managed Redis and Valkey databases that rely on the implicit default user
+
+## [0.46.4] - 2026-03-25
+
+### Bug Fixes
+
+- **`spindb query` now authenticates against local password-protected containers** — The query command loads stored credentials from the container's credential files before calling `executeQuery()`, fixing `NOAUTH` and similar auth errors when running queries against containers that have authentication enabled (e.g., inside Layerbase Cloud)
+
+### Improved
+
+- **MongoDB/FerretDB** — `executeQuery` builds authenticated `mongodb://` URI for local connections when credentials are provided
+- **ClickHouse** — `executeQuery` passes `--user` and `--password` flags when credentials are provided
+- **CouchDB** — `executeQuery` forwards stored credentials to REST API requests instead of always using defaults
+- **SurrealDB** — `executeQuery` uses stored credentials instead of hardcoded `root/root`
+- **CockroachDB** — `executeQuery` uses authenticated `--url` connection when credentials are provided, falls back to `--insecure`
+- **Meilisearch** — `executeQuery` passes API key via `Authorization: Bearer` header
+- **Qdrant** — `executeQuery` passes API key via `api-key` header
+- **InfluxDB** — `executeQuery` passes token via `Authorization: Token` header
+- **Weaviate** — `executeQuery` passes API key via `Authorization: Bearer` header
+
+## [0.46.3] - 2026-03-24
+
+### Added
+
+- **"Set default database" in interactive menu** — Container submenu now shows a `★ Set default database` option for engines that support multiple databases. Queries the server for actual databases, lets the user pick, and automatically adds untracked databases to tracking. Available in both single-db and multi-db views.
+
+## [0.46.2] - 2026-03-19
+
+### Fixed
+
+- **TigerBeetle interactive creation fails with numeric cluster ID** — Interactive menu and `promptCreateOptions` called `promptDatabaseName` for TigerBeetle, which rejects numeric input. TigerBeetle now defaults to `'0'` like Redis/Valkey, skipping the prompt entirely.
+
+## [0.46.1] - 2026-03-18
+
+### Improved
+
+- **`bin-path` command** — Extract error helper to reduce duplication, align engine aliases with `which` command (`mysql`, `maria`, `meili`, `couch`, `influx`, `weav`, `tb`, `lsql`), pretty-print error JSON, document global tool resolution behavior
+- **LibSQL `clientTools`** — Add `sqld` to LibSQL's `clientTools` in `engines.json` so `spindb bin-path libsql` resolves correctly
+
+## [0.46.0] - 2026-03-18
+
+### Added
+
+- **`spindb bin-path` command** — Resolve the absolute path to an engine's binary tool for scripting (e.g., `PSQL=$(spindb bin-path postgresql)`, `spindb bin-path pg --tool pg_dump --json`). Supports engine aliases, `--tool` flag, and `--json` output.
+
+## [0.45.2] - 2026-03-17
+
+### Added
+
+- **Layerbase Cloud provider detection** — `spindb link` auto-detects `provider: 'layerbase'` from `*.layerbase.dev` hostnames
+- **`--provider-id` option for `spindb link`** — stores a provider-specific identifier (e.g., cloud database UUID) in `remote.providerId`
+- **`providerId` field on `RemoteConnectionConfig`** — optional field for provider-specific database identifiers
+
+## [0.45.1] - 2026-03-12
+
+### Fixed
+
+- **LibSQL blob backup encoding** — SQL dump backup now correctly converts blob values from base64 to hex for `X'...'` literals (was outputting raw base64)
+- **LibSQL SQL restore double-quote escaping** — SQL statement splitter now handles escaped double-quotes (`""`) inside quoted identifiers, matching the existing single-quote (`''`) handling
+- **LibSQL version parsing** — Replaced permissive `parseInt` with strict regex validation, rejecting malformed version strings like `"32-beta"`
+- **LibSQL Windows download guard** — `spindb engines download libsql` now exits early with a clear message on Windows, matching the ClickHouse pattern
+- **LibSQL engines.json schema** — Fixed `clientTools` from `null` to `[]` for schema compliance with `EngineConfig` type
+
+## [0.45.0] - 2026-03-12
+
+### Added
+
+- **LibSQL engine** — Engine #21. LibSQL (sqld) is a SQLite fork by Turso that runs as a server with an HTTP API (Hrana protocol). Supports binary and SQL backup/restore formats. macOS and Linux only (no Windows). Default port 8080.
+- **LibSQL JWT authentication** — `createUser()` generates Ed25519 key pairs and signs JWT tokens, following the same pattern as Meilisearch API keys. Credentials stored via credential-manager.
+- **Database creation guard** — `canCreateDatabase()` now gates the `createDatabase` call during container creation, preventing errors for engines that don't support it (LibSQL, TigerBeetle, QuestDB).
+
+## [0.44.1] - 2026-03-12
+
+### Added
+
+- **MongoDB `--auth` support** — `spindb start <name> --auth` passes `--auth` to mongod, requiring clients to authenticate. Persisted across restarts. Default remains no-auth (backwards-compatible).
+- **FerretDB auth toggle** — `spindb start <name> --auth` enables SCRAM authentication on FerretDB v2 (omits `--no-auth` flag). `spindb start <name> --no-auth` restores the default. Persisted across restarts.
+- **Hide deprecated versions** — Version selection prompts now hide major versions where all versions are deprecated. Use `spindb create --show-deprecated` to see them. Individual deprecated versions within non-deprecated majors still show with `[deprecated]` tag.
+
+### Fixed
+
+- **TigerBeetle create fails with numeric cluster ID** — `spindb create --engine tigerbeetle --database 0` failed validation because the generic branch requires names starting with a letter. TigerBeetle now has its own validation branch accepting non-negative integer cluster IDs, defaulting to `'0'`. Leading zeros are normalized (`'007'` → `'7'`).
+- **CouchDB health check timeout after credential change** — `waitForReady()` and `status()` sent `admin:admin` credentials by default. After credentials are changed (e.g., by layerbase-cloud's setup-database.sh), CouchDB returns 401 even though it's running. Health checks now use anonymous requests and accept any non-5xx HTTP response as proof CouchDB is running (fixes `spindb list --json` misreporting when `require_valid_user = true`).
+- **QuestDB health check timeout after credential change** — `waitForReady()` used psql with hardcoded `admin`/`quest` credentials. After custom credentials are configured in `server.conf`, psql auth fails and loops for the full timeout. Now always uses the HTTP health check endpoint which doesn't require authentication.
+- **QuestDB startup timeout** — increased from 60s to 120s (90s → 150s on Windows) to accommodate JVM cold-start times that can take 60-120s
+- **databases.json schema compatibility** — fixed parsing of hostdb's `databases.json` which now wraps engines under a `databases` key. This was silently breaking deprecated version detection, version availability lookups, and CLI tool metadata from hostdb.
+- **Engine preview shows deprecated versions** — the engine selection list (`Select database engine`) now filters deprecated major versions from the version preview (e.g., MySQL shows `8.4, 9.6` instead of `8.0, 8.4, 9.1, 9.5, 9.6`).
+- **Create wizard Back button crash** — pressing Back from version selection to return to engine selection crashed with `Cannot read properties of null (reading 'toLowerCase')`. Fixed wizard state machine to properly reset to engine step.
+- **Redis/Valkey config patch bind regex** — `patchRedisConfig`/`patchValkeyConfig` bind address regex now replaces the full `bind` line to handle multi-address configs (e.g., `bind 127.0.0.1 ::1`).
+- **FerretDB timeout comment mismatch** — corrected comment that stated 60s timeout for Windows pg_ctl start; actual timeout is 30s.
+
+## [0.44.0] - 2026-03-11
+
+### Added
+
+- **Deprecated version awareness** — spindb now reads the `deprecated` flag from hostdb's `databases.json` and `releases.json`
+  - Version selection prompts show `[deprecated]` tag on deprecated versions
+  - Major version groups where all versions are deprecated are labeled accordingly
+  - New `isVersionDeprecated()` helper in `hostdb-metadata.ts`
+  - New `getDeprecatedVersions()` fetches deprecated version sets from hostdb
+  - `hostdb-releases-factory` exposes `fetchDeprecatedVersions()` for programmatic use
+- **MySQL 9.6.0** — added as the latest Innovation Release
+
+### Changed
+
+- **MySQL defaults** — default version updated to `8.4` (LTS), latest version updated to `9.6`
+
+### Deprecated
+
+- **MySQL 8.0.40** — use 8.4.x LTS instead
+- **MySQL 9.1.0** — superseded by 9.6.0
+- **MySQL 9.5.0** — superseded by 9.6.0
+
+## [0.43.1] - 2026-03-08
+
+### Fixed
+- **Redis/Valkey config patch missing dir/logfile/pidfile** — Config preservation now patches `dir`, `logfile`, and `pidfile` in addition to `port`, `bind`, and `daemonize`. Fixes crash after container rename when config still referenced old container directory paths.
+
+## [0.43.0] - 2026-03-07
+
+### Added
+- **`--bind` flag for `spindb start`** — Set bind address for database servers (e.g., `spindb start --bind 0.0.0.0 mydb`). Persisted to container config for subsequent starts without needing to re-specify.
+- **`bindAddress` in `ContainerConfig`** — New optional field stored in container `config.json`. All 18 server engines read `container.bindAddress` and pass it to their spawn args or config files.
+
+### Changed
+- **Config preservation on restart** — Redis, Valkey, CouchDB, and Qdrant no longer regenerate config files from scratch on every start. Existing configs are patched (port, bind address, daemonize) while preserving user modifications like `requirepass`, `[admins]` credentials, and API keys.
+- **ClickHouse bind address** — `generateClickHouseConfig` accepts `bindAddress`; `start()` patches `<listen_host>` in `config.xml` when bindAddress is set.
+- **TypeDB bind address** — Config YAML now uses `bindAddress` from container config for both server and HTTP addresses.
+
+### Fixed
+- **FerretDB daemonization** — Changed FerretDB spawn stdio from `['ignore', 'pipe', 'pipe']` to `['ignore', 'ignore', 'ignore']` for clean process detachment. Removes stream listener cleanup code that couldn't fully prevent event loop hangs.
+
+## [0.42.7] - 2026-03-07
+
+### Bug Fixes
+- **FerretDB start hang** — Unref piped stdout/stderr streams after FerretDB is ready so the Node.js event loop can exit, fixing `spindb start --json` hanging indefinitely
+
+## [0.42.6] - 2026-03-04
+
+### Bug Fixes
+- **SQLite/DuckDB default location** — Changed default database file location from CWD to `~/.spindb/containers/` for consistency with server-based engines
+
+## [0.42.5] - 2026-03-02
+
+### Documentation
+- **CLAUDE.md** — Added link to ecosystem invariants (`INVARIANTS.md`), updated web app description to reflect cloud dashboard is live
+- **TODO.md** — Added `create --no-start` tool check bypass issue for file-based engines
+
+## [0.42.4] - 2026-02-25
+
+### Bug Fixes
+- **Rename bypass message** — Backup/restore rename now shows "native rename bypassed via flags" instead of incorrectly claiming the engine lacks native rename support when `--backup` or `--no-drop` is used
+
+## [0.42.3] - 2026-02-25
+
+### Bug Fixes
+- **JSON rename drop error reporting** — Rename `--json` output now includes `oldDatabaseDropped` and `oldDropError` fields instead of silently swallowing drop failures
+- **Meilisearch task poll redundant re-fetch** — Polling loop now tracks success and skips the final re-fetch when the task already succeeded, preventing transient network errors from failing a completed rename
+
+## [0.42.2] - 2026-02-25
+
+### Bug Fixes
+- **`--no-drop` with native rename** — Native rename path now respects `--no-drop` flag by falling back to backup-restore strategy, preserving the original database
+- **Positional arg validation** — `databases create`, `drop`, and `rename` now validate database names from CLI positional arguments (not just interactive prompts), rejecting path traversal, spaces, and invalid characters
+- **Meilisearch taskUid guard** — Throw descriptive error when Meilisearch returns 202 without a `taskUid` instead of silently succeeding
+
+### Documentation
+- **CHEATSHEET.md** — Fixed "fixed numbered" to "fixed-numbered" compound adjective
+
+## [0.42.1] - 2026-02-24
+
+### Bug Fixes
+- **Native rename tracking** — Fixed bug where native rename (PostgreSQL, ClickHouse, CockroachDB, Meilisearch) never removed the old database name from tracking
+- **Drop success tracking** — Menu rename handler now tracks actual drop outcome instead of user intent, preventing stale tracking entries when drop fails
+- **Null guard after drop** — Added null guard when re-fetching config after database drop in case the container was deleted externally
+- **Orphaned database warning** — Show warning when rollback cleanup fails during rename, so users know manual cleanup may be needed
+- **Reserved database guards** — Block renaming reserved databases: ClickHouse (`default`, `system`), CockroachDB (`defaultdb`, `postgres`, `system`), PostgreSQL (`postgres`, `template0`, `template1`)
+- **Meilisearch async task polling** — Poll task status after rename (202 response) instead of assuming success; log warnings on non-200 poll responses
+- **MongoDB exit code handling** — Unconditionally reject on non-zero mongosh exit code instead of silently succeeding
+
+### Improvements
+- **Non-interactive mode guards** — `databases create`, `drop`, and `rename` now error with usage hints when arguments are missing in non-interactive (piped) mode instead of hanging
+- **`disabledItem()` deduplication** — Extracted duplicated helper from two closures to module scope
+- **CHEATSHEET.md** — Moved `query` to supported operations for remote containers; updated "primary" to "default" terminology
+
+## [0.42.0] - 2026-02-24
+
+### Added
+- **Hybrid database submenu** — Multi-database containers now show a "Databases (N)" entry that opens a database list, where selecting a database opens a per-database action menu (shell, run SQL, copy URL, rename, drop, backup, restore). Single-database containers keep all actions inline with zero extra clicks.
+- **Native rename for PostgreSQL** — Uses `ALTER DATABASE "old" RENAME TO "new"` (atomic, instant, available since PG 7.4). Terminates active connections first since PostgreSQL requires zero connections to the target database.
+- **Native rename for Meilisearch** — Uses `PATCH /indexes/{uid}` with `{"uid": "new-name"}` (atomic, available since Meilisearch v1.18.0).
+- **Capability/implementation consistency tests** — New unit tests verify every native-rename engine overrides `renameDatabase()` and backup-restore engines do not, catching misclassifications automatically.
+
+### Fixed
+- **MongoDB shell injection** — `executeQuery()` replaced `execAsync(cmd)` with `spawn(mongosh, args)`, preventing shell injection via crafted query strings.
+- **REST API URL encoding** — Added `encodeURIComponent(database)` to URL path segments in Qdrant, Weaviate, and Meilisearch engines, preventing errors with special characters in collection/index names.
+- **Stale status checks in database handlers** — `handleCreateDatabase`, `handleRenameDatabase`, and `handleDropDatabase` now use live `processManager.isRunning()` instead of cached `config.status` which could be stale.
+- **Config mutation in query command** — Remote container port override now uses `config = { ...config, port }` instead of mutating the shared config object directly.
+
+### Improved
+- **"Set as default" in per-database menu** — Multi-database containers can set any database as the default directly from the per-database action menu.
+- **Rename/drop accept target database** — `handleRenameDatabase` and `handleDropDatabase` accept an optional `targetDatabase` parameter, skipping the selection prompt when called from the per-database action menu.
+- **"Primary" → "default" terminology** — Consistent use of "default" instead of "primary" across all database operation UI strings.
+
+### Removed
+- **`handleSelectDatabase`** and **`handleChangeDefaultDatabase`** — Replaced by the databases submenu and "Set as default" action in the per-database menu.
+
+## [0.41.0] - 2026-02-24
+
+### Added
+- **Database create/rename/drop commands** — `spindb databases create`, `spindb databases rename`, and `spindb databases drop` perform real database operations on running containers. Supports 14 of 20 engines with full `--json` output for scripting.
+- **Rename strategies** — Native `ALTER DATABASE`/`RENAME DATABASE` for ClickHouse and CockroachDB. All other engines use a safe backup → create → restore → drop sequence with safety backups retained at `~/.spindb/backups/rename/`. Includes `--backup` flag to force backup strategy and `--no-drop` to keep the old database after copying.
+- **Database capabilities system** — `core/database-capabilities.ts` provides a static capability map for all 20 engines with per-engine unsupported messages. Unsupported engines (SQLite, DuckDB, Redis, Valkey, QuestDB, TigerBeetle) show clear error messages with alternative instructions.
+- **Interactive menu integration** — Container submenu shows "Create database", "Rename database", and "Drop database" options when the engine supports them, with running-state guards and server-side duplicate detection.
+- **Shared rename tracking** — `updateRenameTracking()` in `core/container-manager.ts` centralizes the add-new/remove-old/update-primary logic used by CLI commands and menu handlers.
+
+### Improved
+- **Rename explains strategy** — Backup/restore renames now tell the user why cloning is needed (e.g., "MariaDB does not support native database renaming") and offer to keep the original after cloning.
+- **Escape key in database operations** — Pressing Escape during create/rename/drop prompts returns to the container submenu instead of jumping to the main menu. Mid-operation Escape (e.g., on "Delete the original?") is treated as cancel/no, completing the operation safely.
+- **Post-operation summaries** — Create, rename, and drop handlers now show consistent success messages with connection strings and backup paths matching the existing backup handler pattern.
+- **Drop excludes primary with explanation** — The drop database list notes that the primary is excluded and suggests `spindb delete` for full removal.
+
+## [0.40.1] - 2026-02-22
+
+### Fixed
+- **PostgreSQL remote SSL** — `--set=sslmode=require` was a psql variable, not a libpq setting, so TLS was never actually enabled for remote queries. Now uses `PGSSLMODE=require` environment variable.
+- **MongoDB/FerretDB SRV conflation** — `ssl: true` incorrectly forced `mongodb+srv://` scheme, breaking self-hosted TLS and DocumentDB connections. SRV is now determined by the original connection string scheme; non-SRV TLS connections use `mongodb://host:port?tls=true`.
+- **MySQL/MariaDB credential exposure** — Password was passed via `-p` command-line argument, visible in process listings. Now uses `MYSQL_PWD` environment variable.
+- **Redis/Valkey credential exposure** — Password was passed via `-a` command-line argument. Now uses `REDISCLI_AUTH` environment variable (matching existing `dumpFromConnectionString` pattern). Also adds `--user` flag for ACL username support.
+- **Valkey missing `--raw` flag** — `valkey-cli` output was not raw, causing the Redis result parser to receive formatted output.
+
+## [0.40.0] - 2026-02-22
+
+### Added
+- **Remote container query support** — `spindb query` now works with linked remote containers. Loads credentials from the credential manager, parses the connection string, and passes host/port/password/username/SSL to the engine's native CLI client (psql, mysql, mongosh, redis-cli, etc.). Supported for PostgreSQL, MySQL, MariaDB, MongoDB, FerretDB, Redis, and Valkey engines.
+
+### Changed
+- **QueryOptions type** — Added optional `host`, `password`, `username`, and `ssl` fields for remote container connections. Local queries are unaffected (all fields default to existing behavior).
+- **`query` no longer listed as unsupported for remote containers** — Remote containers now support `connect`, `url`, `info`, `list`, `delete`, and `query`. Remaining unsupported operations: `backup`, `run`, `restore`, `export`, `clone`, `start`, `stop`, `logs`.
+
+## [0.39.0] - 2026-02-21
+
+### Added
+- **Remote database linking** — `spindb link <connection-string>` connects external databases (cloud-hosted or local non-SpinDB instances) to SpinDB. Auto-detects engine from URL scheme (postgresql://, mysql://, mongodb://, redis://) and provider from hostname (Neon, Supabase, PlanetScale, Upstash, Railway, Aiven, CockroachDB Cloud). Linked containers appear in `spindb list` with `↔ linked` status and provider name. Supports `spindb connect`, `spindb url`, `spindb info`, `spindb delete` (metadata-only unlink).
+- **Interactive linking** — "Link remote database" option in the interactive menu with connection string masking (passwords auto-redacted while typing), duplicate name re-prompting, and direct navigation to the container submenu after linking.
+- **Remote container console** — `spindb connect` and the interactive console menu work with linked containers. CLI shells (psql, pgcli, usql, mongosh, mysql, redis-cli, etc.) receive the remote connection string. Web panels (pgweb, dblab, DuckDB UI, ClickHouse Play, QuestDB Console) are hidden for remote containers since they require local servers.
+- **`spindb url --password`** — Shows the full unredacted connection string for linked containers. Default output redacts passwords with `***`.
+- **New `RemoteConnectionConfig` type** and `isRemoteContainer()` type guard in `types/index.ts`. New `'linked'` container status.
+- **New `core/remote-container.ts`** — Connection string parsing, engine/provider auto-detection, name generation, redaction, and remote config builder utilities.
+
+### Changed
+- **Graceful rejection for unsupported operations** — `start`, `stop`, `clone`, `logs`, `restore`, `export`, `backup`, `run` show clear messages for linked containers instead of errors. `stop` exits non-zero for linked containers.
+- **Container manager** — `list()` preserves `'linked'` status without process checks. `delete()` removes only local metadata for remote containers. `syncDatabases()` returns stored databases for remote containers.
+- **Menu reordering** — "Ports" moved below "Link remote database" in the main menu. Ports only shown when containers exist.
+- **Separated `tsc` type checking** — New `pnpm check` script for `tsc --noEmit`, `pnpm lint` now runs ESLint then type checking.
+
+### Fixed
+- **TigerBeetle default port** — `getDefaultPortForEngine` returned 3001 instead of 3000 (matching `engines.json`).
+- **Redis/Valkey remote database index** — Remote iredis, redis-cli, and valkey-cli connections now pass `-n database` flag.
+- **Empty database from Redis URLs** — `redis://host:6379` no longer resolves to empty string; falls back to `'default'`.
+- **`spindb url --json` error handling** — Container-not-found and catch errors now honor `--json` flag.
+- **Clone source list** — Linked containers no longer appear in the interactive clone source picker.
+
+## [0.38.1] - 2026-02-21
+
+### Fixed
+- **Windows Redis/Valkey creation failure** — Creating Redis, Valkey, and other non-PostgreSQL containers failed on Windows because the dependency check ran before binaries were downloaded. Since Windows has no system fallback paths for these engines, `getMissingDependencies()` always reported them as missing. Binary download now runs first for all engines (not just PostgreSQL), ensuring tools are registered before the dependency check.
+
+## [0.38.0] - 2026-02-20
+
+### Added
+- **TigerBeetle engine** — 20th database engine. High-performance financial ledger database written in Zig. Apache-2.0 license. Full lifecycle support: create, start, stop, backup/restore, clone, rename, delete. Custom binary protocol on default port 3000. Uses REPL for interaction (`spindb connect`). Two-step init with `tigerbeetle format` + `tigerbeetle start`. Stop-and-copy backup of single data file. Uses `--development` flag for local dev.
+- **Compiled build pipeline** — SpinDB now ships compiled JavaScript (`dist/`) instead of TypeScript source. Removes tsx as a runtime dependency, reducing install size and improving startup time. Uses `tsc` + `tsc-alias` build pipeline with auto-generated version constant.
+- **FerretDB fallback binary search** — `pg_dump`, `pg_restore`, and `psql` now search all installed PostgreSQL and postgresql-documentdb versions (newest first) when the container's specific backend binary is missing. Falls back to system binaries registered via `spindb config set`. Eliminates "pg_dump not found" errors when the exact backend version isn't installed but another compatible version is available.
+
+### Changed
+- **Simplified dependency install prompts** — `promptInstallDependencies` now directs users to `spindb engines download <engine>` instead of attempting system package manager installation. All engine binaries (including client tools) are bundled with hostdb downloads.
+- **Redis Windows package reference** — Updated winget package from `tporadowski.redis` to `Redis.Redis` (official Redis package)
+
+### Removed
+- **System package manager installation** — Removed `_installEngineViaPackageManager` and related helpers (`displayManualInstallInstructions`). Engine binaries should be installed via `spindb engines download` instead.
+
+## [0.37.2] - 2026-02-17
+
+### Fixed
+- **`--engine` help text derived from `ALL_ENGINES`** — The `create --help` engine list was hardcoded and missing Weaviate and TigerBeetle. Now dynamically generated from the `ALL_ENGINES` array so new engines appear automatically. Also fixed the hardcoded engine list in the `engines download` error message.
+
+## [0.37.1] - 2026-02-16
+
+### Added
+- **Engine metadata in `--json` output** — All commands that return engine or container data now include `queryLanguage`, `runtime`, and `connectionScheme` fields. Allows consumers like layerbase-desktop to read engine semantics directly from SpinDB output instead of maintaining a separate mapping. Affected commands: `list`, `info`, `create`, `start`, `delete`, `restore`, `url`, `engines`, `databases`.
+
+## [0.36.2] - 2026-02-16
+
+### Fixed
+- **macOS dylib error detection** — MariaDB, Redis, and Valkey now detect `dyld: Library not loaded` errors at startup and surface actionable messages (e.g., `brew install openssl@3`) instead of cryptic timeouts. Also detects GLIBC and missing shared library errors on Linux.
+- **Library path fallback for hostdb binaries** — MariaDB, Redis, and Valkey spawn calls now set `DYLD_FALLBACK_LIBRARY_PATH` (macOS) / `LD_LIBRARY_PATH` (Linux) to `{binPath}/lib`, preparing for when hostdb ships relocatable builds with bundled dylibs.
+
+## [0.36.1] - 2026-02-16
+
+### Fixed
+- **Weaviate Windows spawn stdio** — Changed Windows spawn from piped stdio to `['ignore','ignore','ignore']` to prevent Node.js process hangs in Docker/CI, matching the pattern used by all other engines.
+- **Weaviate createUser flag tracking** — Fixed `createUser` to track each authentication setting independently instead of using a single flag that could miss settings when only some existed in the env file.
+- **Weaviate Nerd Font icon collision** — Changed Weaviate Nerd Font glyph from `\uf14e` (shared with Qdrant) to `\uf0e8` (nf-fa-sitemap) for a unique icon.
+- **Weaviate restore redundant import** — Replaced dynamic `import('fs/promises')` with static import for `copyFile`.
+- **CI debug log safety** — Replaced `ls | grep` pipe with glob pattern `ls weaviate-*` in Weaviate CI debug steps to avoid broken pipe issues.
+- **README engine counts** — Updated all references from 18 to 19 engines, added `weaviate` to engine list and limitations section.
+- **Weaviate README code blocks** — Added language specifiers to fenced code blocks (MD040).
+- **Weaviate connection string error leak** — `parseWeaviateConnectionString` now redacts query params (including `api_key`) from error messages to avoid exposing secrets in logs.
+- **Weaviate port check shared timestamp** — gRPC and HTTP port availability checks now use independent start timestamps so each gets its full timeout window.
+- **Weaviate startup log capture** — Spawn now redirects stdout/stderr to the log file via file descriptor instead of discarding, so `checkLogForError` can actually find startup errors (e.g., "Address already in use").
+
+## [0.36.0] - 2026-02-16
+
+### Added
+- **Weaviate engine** — 19th database engine. AI-native vector database with REST/GraphQL and gRPC APIs. BSD-3-Clause license. Full lifecycle support: create, start, stop, backup/restore, clone, rename, delete. REST API on port 8080, gRPC on port+1. Uses classes/collections instead of traditional databases. Unique internal cluster ports (gossip, data, raft) derived from HTTP port to avoid conflicts between containers.
+- **Weaviate backup/restore** — Directory-based filesystem backups via Weaviate REST API. Restore reads `backup_config.json` to match the internal backup ID (Weaviate validates the directory name). Cross-container restore uses `node_mapping` for hostname translation.
+- **Weaviate CI** — Integration tests on all 5 platforms in `ci.yml` and `ci-full.yml` with binary caching.
+- **Weaviate backup generator** — `pnpm generate:backup weaviate` script for creating test fixture backups on demand.
+
+### Fixed
+- **Weaviate backup timeout detection** — Backup creation and restore polling loops now fail explicitly on timeout instead of silently continuing. Backup generator script also fails with actionable error if the backup directory is missing after API reports success.
+- **Weaviate remote dump guard** — `dumpFromConnectionString` now throws a clear error explaining that Weaviate filesystem backups can't be downloaded over HTTP, with alternative approaches listed.
+- **Weaviate batch insert validation** — Demo seed script now checks per-object results from the batch API (which returns 200 even when individual objects fail).
+- **Weaviate auth persistence** — `start()` now reads `weaviate.env` file so API key/auth settings from `createUser` persist across restarts.
+
+### Changed
+- **Alphabetical engine ordering** — Engine selection prompt and `spindb engines list` now display engines in alphabetical order instead of insertion order. Previously engines were listed in the order they were added to the codebase.
+
+## [0.35.4] - 2026-02-15
+
+### Fixed
+- **CI injection hardening** — `version-check.yml` now uses environment variables instead of direct `${{ }}` interpolation in shell/JS to prevent injection from crafted version strings.
+- **CI failure reporting** — `ci-success` gateway job now prints which specific jobs failed instead of a generic error message.
+
+### Changed
+- **Restore individual CI workflow files** — Brought back `ci-fast.yml`, `ci-full.yml`, and `version-check.yml` so individual job checks are visible on PRs. Removed weekly schedule from `ci-full.yml` (manual dispatch only).
+- **CI full matrix parity** — Added missing `test-influxdb` and `test-ferretdb-v1` jobs to `ci-full.yml` with full 5-runner matrices.
+
+## [0.35.3] - 2026-02-15
+
+### Added
+- **Platform-aware engine filtering** — `spindb engines supported` now filters engines and versions by the current platform. ClickHouse is hidden on Windows; FerretDB v2 is hidden on Windows (only v1 shown). Engines with no platform restrictions are unaffected.
+- **`platforms` and `versionPlatforms` fields in engines.json** — New optional schema fields allow declaring engine-level and per-version platform support in the registry.
+
+## [0.35.2] - 2026-02-15
+
+### Fixed
+- **FerretDB v1 Windows auto-selection bypass** — Moved the Windows v1 guard in `create.ts` to run after both CLI and interactive prompt paths resolve engine + version. Previously, selecting FerretDB via the interactive menu on Windows would bypass the v2→v1 fallback. Also catches explicit `--db-version 2` on Windows (uses `isFerretDBv1()` instead of `!options.dbVersion`).
+- **`formatBytes` out-of-bounds** — Clamped unit index to prevent array overflow on extremely large byte values.
+
+### Changed
+- **Type-safe engine names** — QuestDB and SurrealDB `binary-urls.ts` now use `Engine` enum instead of string literals for `buildHostdbUrl` calls.
+- **Registry fetch timeout** — `fetchFromRegistryUrls()` now accepts an optional per-request timeout (default 5s) to prevent hanging on unresponsive registries.
+
+### Docs
+- **CLAUDE.md** — Fixed stale reference to removed `edb-binary-urls.ts`; PostgreSQL/Windows now correctly documented as EDB-sourced binaries uploaded to hostdb.
+
+## [0.35.1] - 2026-02-15
+
+### Changed
+- **Migrate remaining engines to hostdb-releases factory pattern** — CockroachDB, SurrealDB, QuestDB, and TypeDB `hostdb-releases.ts` files replaced with the standard `createHostdbReleases()` factory (same as Redis, PostgreSQL, etc.). Eliminates ~400 lines of duplicated fetch/cache/fallback logic across the four engines.
+- **SQLite and DuckDB version lookups use factory** — Both file-based engines now delegate `fetchAvailableVersions()` to their existing factory-based `hostdb-releases.ts` modules instead of calling `fetchHostdbReleases()` (releases.json) directly.
+- **Version source migrated from releases.json to databases.json** — All engine version lookups now go through `databases.json` (via `core/hostdb-metadata.ts`) instead of the legacy `releases.json`. This provides a better offline fallback chain: databases.json → locally installed binaries → hardcoded version map.
+
+### Docs
+- **CLAUDE.md** — New "Version Lookups (hostdb-releases factory pattern)" section documenting the factory, the three-tier fallback chain, all three hostdb data files, and the canonical template.
+- **PRE_RELEASE_TASKS.md** — New "hostdb Data Sync" section with tasks for a GitHub Actions cron job to sync `databases.json`, `releases.json`, and `downloads.json` from hostdb, and long-term merge of hostdb into spindb.
+
+## [0.35.0] - 2026-02-15
+
+### Changed
+- **Layerbase registry as primary binary source** - All binary downloads and `releases.json` fetches now use `registry.layerbase.host` as the primary registry, replacing direct GitHub hostdb downloads. GitHub remains available as a fallback, controlled by the `ENABLE_GITHUB_FALLBACK` constant in `core/hostdb-client.ts`.
+- **Centralized registry URL management** - All engine-specific `hostdb-releases.ts` files now use the shared `getReleasesUrls()` helper from `core/hostdb-client.ts` instead of hardcoding registry URLs. This ensures the fallback toggle is respected consistently across all 18 engines.
+
+### Added
+- **`ENABLE_GITHUB_FALLBACK` toggle** - New constant in `core/hostdb-client.ts` to enable/disable the GitHub fallback for testing the Layerbase registry in isolation. Currently set to `false` for pre-release registry testing.
+- **`PRE_RELEASE_TASKS.md`** - Tracking file for tasks that must be addressed before the next release (re-enable GitHub fallback, document registry data files).
+- **`spindb query` in cheatsheet** - Documented the `query` command with table and JSON output modes, including MongoDB/FerretDB query syntax.
+
+### Docs
+- **FerretDB v1 vs v2 documentation** - CLAUDE.md, ARCHITECTURE.md, and CHEATSHEET.md now document v1/v2 differences: backend type (plain PG vs DocumentDB), platform support (v1 includes Windows), cascade delete behavior (v1 does not delete shared PG binaries), auth/SSL differences, and startup sequences.
+- **Registry migration** - CLAUDE.md and ARCHITECTURE.md updated to reflect Layerbase as the primary binary source with GitHub as fallback. Platform support table in ARCHITECTURE.md now splits FerretDB into v1/v2 columns.
+
+## [0.34.10] - 2026-02-15
+
+### Fixed
+- **Socket leak in FerretDB v1 test** - Added `socket.destroy()` in the error handler for the PostgreSQL backend connectivity check, preventing lingering handles.
+- **CI comment accuracy** - Updated OS Coverage Strategy comment to clarify that only FerretDB v2 (not v1) lacks Windows support.
+
+### Changed
+- **Type-safe engine names in binary URLs** - CockroachDB and TypeDB `binary-urls.ts` now use the `Engine` enum instead of string literals for `buildHostdbUrl` calls.
+- **Shared registry fetch utility** - Extracted the multi-URL fetch loop from QuestDB's `hostdb-releases.ts` into `fetchFromRegistryUrls()` in `core/hostdb-client.ts`.
+
+## [0.34.9] - 2026-02-14
+
+### Fixed
+- **FerretDB Windows process termination** - `stopFerretDBProcess()` now force-kills the proxy directly on Windows. Previously, `taskkill` without `/F` sent `WM_CLOSE` (ignored by console processes), throwing an error that made the force-kill fallback and PID file cleanup unreachable. This caused the proxy to stay alive, blocking restores (0 documents), stops (`waitForStopped` timeout), and deletes (EBUSY file locks).
+- **FerretDB Windows PostgreSQL stop** - `stopPostgreSQLProcess()` now uses `exec()` on Windows instead of `spawnAsync()` with piped stdio, preventing pipe-related hangs (same pattern as the `pg_ctl start` Windows fix).
+
+## [0.34.8] - 2026-02-14
+
+### Fixed
+- **FerretDB v1 Windows startup** - `pg_ctl -w` (wait mode) hangs indefinitely on Windows even after PostgreSQL reports ready. Now omits `-w` on Windows and relies on `waitForPort()` for readiness detection.
+
+## [0.34.7] - 2026-02-14
+
+### Fixed
+- **FerretDB restore data visibility** - After `pg_restore`, the FerretDB proxy is now automatically restarted so it picks up the restored collections and documents. Previously, FerretDB's in-memory metadata cache would show 0 documents after a restore because the proxy didn't know about data written directly to PostgreSQL.
+
+## [0.34.6] - 2026-02-14
+
+### Added
+- **FerretDB v1 support** - FerretDB now supports both v1 (1.24.2) and v2 (2.7.0). v1 uses plain PostgreSQL as backend (lighter, all platforms including Windows), v2 uses postgresql-documentdb (macOS/Linux only). Version number determines which backend is used automatically.
+- **FerretDB Windows support** - FerretDB v1 enables Windows compatibility. `spindb create` auto-selects v1 on Windows when no version is specified.
+- **FerretDB v1 integration tests** - Full integration test suite for FerretDB v1 (`tests/integration/ferretdb-v1.test.ts`) covering container lifecycle, seed, backup/restore, rename, port conflict, and partial shutdown recovery. v1 restore asserts exact row count (no DocumentDB metadata conflicts).
+- **FerretDB v1 CI job** - New `test-ferretdb-v1` CI job runs on all 5 platforms including Windows. Runs after v2 job to avoid backend port conflicts.
+- **FerretDB binary URL unit tests** - New `tests/unit/ferretdb-binary-urls.test.ts` tests v1 vs v2 platform support (5 vs 4 platforms), Windows support, and binary URL generation differences.
+- **FerretDB v1 version validator tests** - Added `isV1()`, `FERRETDB_VERSION_MAP['1']`, and `DEFAULT_V1_POSTGRESQL_VERSION` test coverage to existing version validator test file.
+- **FerretDB v1 test runner support** - `pnpm test:engine ferretdb-v1` (aliases: ferret-v1, fdb-v1, fdb1) runs v1 integration tests independently from v2.
+- **FerretDB v1 demo containers** - `pnpm generate:missing` now creates both `demo-ferretdb` (v2) and `demo-ferretdb-v1` (v1) via `VERSION_OVERRIDES` map.
+
+### Changed
+- **FerretDB engine download** - `spindb engines download ferretdb` now supports version selection. On Windows, v2 is blocked with a helpful message suggesting v1.
+- **FerretDB engine deletion** - v1 installations skip PostgreSQL backend cleanup (shared with standalone PostgreSQL containers). v2 continues to clean up postgresql-documentdb as before.
+- **FerretDB platform support** - Removed blanket Windows block; platform checks are now version-aware.
+
+### Fixed
+- **FerretDB v1 startup** - Auth flag (`--no-auth`) only passed for v2 (v1 has auth disabled by default). PostgreSQL URL includes `sslmode=disable` for v1 (pgx driver defaults to TLS).
+- **FerretDB database creation** - When psql is unavailable in the PostgreSQL backend, uses `postgres --single` mode pre-start to create the ferretdb database.
+- **Menu container creation** - Added error handling around engine start in interactive menu. On start failure, orphaned containers are now cleaned up automatically.
+
+## [0.34.5] - 2026-02-11
+
+### Added
+- **`spindb duckdb` command group** - New `spindb duckdb scan/attach/detach/ignore/unignore/ignored` subcommands, mirroring the existing `spindb sqlite` command group
+- **DuckDB CWD scanning** - `spindb list` now scans for unregistered `.duckdb` and `.ddb` files in the current directory (alongside existing SQLite scanning)
+- **DuckDB backup detection** - `.duckdb` and `.ddb` files are now recognized in `spindb backups`
+- **Centralized file-based engine utilities** - New `engines/file-based-utils.ts` module as single source of truth for extension mapping, engine detection, registry access, container name derivation, and file scanning. Adding a future file-based engine requires changes in only one file.
+
+### Changed
+- **Generalized file-based engine support** - All SQLite-specific behavior (attach, detach, connect, edit relocate, list, info, doctor) now applies to all file-based engines (SQLite and DuckDB) via `isFileBasedEngine()` checks
+- **`spindb attach`** - Now auto-detects engine from file extension (`.sqlite/.sqlite3/.db` → SQLite, `.duckdb/.ddb` → DuckDB) instead of assuming SQLite
+- **`spindb detach`** - Works with any file-based container, not just SQLite
+- **`spindb edit --relocate`** - Extension validation is now engine-aware (SQLite containers only accept SQLite extensions, DuckDB only DuckDB)
+- **Extension guards on engine-specific attach** - `spindb sqlite attach foo.duckdb` and `spindb duckdb attach foo.sqlite` now reject with helpful error messages pointing to the correct command
+- **SQLite/DuckDB scanners refactored** - Both are now thin wrappers around the centralized `file-based-utils` module, eliminating code duplication
+
+### Fixed
+- **`generate:missing` demo databases** - File-based engines (SQLite, DuckDB) now create demo databases in `~/.spindb/demo/` instead of polluting the current working directory
+
+## [0.34.3] - 2026-02-10
+
+### Added
+- **InfluxDB script file support** - `spindb run` now supports both `.lp` (line protocol) and `.sql` files for InfluxDB. Line protocol files write data via REST API, SQL files execute queries.
+- **InfluxDB auto-database creation** - Databases are automatically created before running scripts or inline SQL, so SQL queries work without prior LP seeding.
+- **InfluxDB database discovery** - Console and "Run SQL/LP file" menu now discover real databases via REST API instead of relying on the container's configured database name (which may not exist yet in InfluxDB).
+- **InfluxDB test fixtures** - Added `sample-db.lp` seed fixture and `sample-queries.sql` verification queries.
+
+## [0.34.2] - 2026-02-10
+
+### Added
+- **InfluxDB query shell** - InfluxDB console now offers `influxdb3 query` as the default shell, using the same binary as the server. Supports SQL queries via stdin.
+- **QuestDB Web Console** - QuestDB console menu now shows "Open Web Console" under the Web Panel section, launching the built-in browser-based SQL IDE on the HTTP port (PG port + 188).
+
+### Fixed
+- **InfluxDB usql removed** - InfluxDB was incorrectly offered `usql` as a console option. InfluxDB 3.x only supports HTTP REST API / FlightSQL, not a SQL wire protocol that usql can connect to. Changed `queryLanguage` from `sql` to `rest`.
+- **Console menu icon alignment** - Replaced wide emoji icons (`⚡`, `>_`) with consistent single-width characters (`★`, `▸`) so menu items align properly across terminals.
+
+## [0.34.1] - 2026-02-10
+
+### Added
+- **dblab visual TUI** - Interactive terminal UI for browsing tables, editing queries, and viewing results. Downloaded on-demand from GitHub releases (v0.34.2, MIT license). Supports PostgreSQL, MySQL, MariaDB, CockroachDB, SQLite, QuestDB. Available from the console menu and via `spindb connect --dblab` / `--install-dblab` CLI flags.
+- **DuckDB built-in Web UI** - Open DuckDB's built-in browser UI (port 4213) from the console menu under "Web Panel" section. Also available via `spindb connect --ui` CLI flag.
+- **Branding assets** - SVG logo concepts in `assets/` (tray icon, gradient, wordmark, smark) and `assets/concepts/` for future finalization
+- **Ports status column** - `spindb ports` now shows a colored status indicator (running/available/missing/stopped) for each port
+
+### Changed
+- **Dynamic menu page sizing** - Interactive menu lists now scale with terminal height (10–30 visible items) instead of a fixed 15 or 20, making better use of tall terminals
+
+## [0.34.0] - 2026-02-10
+
+### Added
+- **pgweb web panel** - Browser-based database viewer for PostgreSQL, CockroachDB, and FerretDB. Downloaded on-demand from GitHub releases (v0.17.0, MIT license). Spawns as a background process per container, auto-stops when the database stops. Available from the console menu under "Web Panel" section.
+- **`spindb ports` command** - Show all ports used by containers (primary, secondary HTTP/gRPC/ILP, and pgweb). Supports `--json` and `--running` flags. Also available as "Ports" in the interactive main menu.
+- **pgweb stop in container submenu** - Stop pgweb directly from the container view without navigating into the console submenu
+
+### Fixed
+- **FerretDB pgweb connection** - pgweb was connecting to the wrong database (user's MongoDB database name instead of `ferretdb`) and falling back to the MongoDB port (27017) when `backendPort` was unset
+- **FerretDB start with orphaned PostgreSQL backend** - Starting a FerretDB container no longer fails if the PostgreSQL backend is still running from a previous partial shutdown. Uses `pg_ctl status` to detect and skip redundant backend startup.
+
+### Changed
+- **"Open shell" renamed to "Open console"** - Container menu and submenu labels updated to reflect that both CLI shells and web panels are available
+- **Console menu grouping** - Web panels (pgweb, ClickHouse Play UI) are separated from CLI tools with a labeled "Web Panel" section header
+- **Container list toggle hint** - Shift+Tab hint moved above container list for better visibility
+
+## [0.33.1] - 2026-02-10
+
+### Fixed
+- **SurrealDB rename test** - Fixed ENOENT error when verifying data after container rename. The `getSurrealDBRowCount` test helper used the original container name for `cwd`, but the directory moves to the new name during rename. Added `actualContainerName` parameter to resolve the correct path.
+
+### Changed
+- **Documentation cleanup** - Consolidated CLI examples into CHEATSHEET.md, removed redundant CONTRIBUTING.md, EXAMPLES.md, and USE_CASES.md files. Updated ARCHITECTURE.md, README.md, LICENSE, and other docs.
+
+## [0.33.0] - 2026-02-09
+
+### Added
+- **InfluxDB engine support** - 18th database engine. REST API time-series database (InfluxDB 3.x Rust rewrite) with SQL query support via HTTP API. Default port 8086, binary `influxdb3`. Databases created implicitly on first write, no auth by default for local development. Health check via `GET /health`, queries via `POST /api/v3/query_sql`, writes via `POST /api/v3/write_lp` (line protocol). Version 3.8.0, all 5 platforms supported (macOS ARM/x64, Linux ARM/x64, Windows x64). License: Apache-2.0 AND MIT.
+- **InfluxDB backup/restore** - SQL-based backup exports data as INSERT statements with tag column metadata; restore parses SQL, converts to line protocol, and writes via write_lp endpoint for faithful round-trip including tag/field distinction
+- **InfluxDB remote dump** - `dumpFromConnectionString` queries remote InfluxDB instances via REST API and exports SQL backup files
+- **InfluxDB connection string detection** - `influxdb://` scheme recognized in `detectLocationType` for `spindb create` from connection strings
+
+### Fixed
+- **InfluxDB node-id stability** - Fixed `--node-id` to `"spindb"` instead of container name so data persists through container renames
+- **InfluxDB identifier escaping** - Escape single quotes in SQL WHERE clauses and double quotes in SQL identifiers defensively in backup and remote dump
+- **InfluxDB remote dump warnings** - Failed table exports now surfaced in warnings array instead of silently logged
+
+## [0.32.2] - 2026-02-08
+
+### Added
+- **TypeDB engine support** - 17th database engine. Knowledge graph database with TypeQL query language, Rust-native binary, port 1729. Supports backup/restore via TypeQL export/import, database management, and interactive console via `spindb connect`. Version 3.8.0, all 5 platforms supported.
+
+### Fixed
+- **TypeDB console commands** - Use temp script files with `--script` instead of `--command` for transaction-based operations (queries, schema changes, data modifications). TypeDB console `--command` mode only supports standalone top-level commands, not multi-step transaction flows.
+- **TypeDB backup/restore** - Handle schema/data pair files (`-schema.typeql`, `-data.typeql`) in format detection and file existence checks
+- **TypeDB rename/port change** - Regenerate `config.yml` on every start to ensure paths and port are correct after rename or port reassignment
+- **CI full matrix** - Added `test-typedb` job to `ci-full.yml` weekly workflow and wired into `ci-success` gate
+- **TEST_COVERAGE.md** - Corrected FerretDB Windows exception reason (postgresql-documentdb startup issues, not missing binaries)
+- **Docker E2E log paths** - Use `${SPINDB_HOME:-$HOME/.spindb}` for container log directory instead of hardcoded `$HOME/.spindb`
+
+## [0.32.1] - 2026-02-07
+
+### Fixed
+- **FerretDB darwin-x64 support** - Fixed initdb and server startup for Homebrew-derived PostgreSQL-DocumentDB binaries by resolving compiled-in paths (sharedir, pkglibdir, libdir) via symlinks, adding `DYLD_FALLBACK_LIBRARY_PATH`, and scanning extension dylibs for missing Homebrew dependencies with `otool -L`
+- **Redis createUser** - Pass ACL command via stdin instead of argv to avoid exposing passwords in process listings
+- **Valkey createUser** - Pass container version to `getValkeyCliPath()` for version-aware CLI resolution
+- **Qdrant createUser** - Set config file permissions to 0600 after writing API key
+- **Credential manager** - Parse .env values from original line to preserve whitespace; set credentials directory mode to 0700
+- **Startup timeouts** - Increased readiness timeouts for engines that spawn CLI binaries per health check (Redis/Valkey/SurrealDB: 30s → 60s, MySQL/MariaDB: 15s → 30s) to prevent false failures under slow environments like QEMU ARM64 emulation
+- **Docker E2E smoke test** - Use `timeout --foreground` to only kill the child process on timeout, preventing the test script itself from being killed and swallowing error output
+- **FerretDB path fixup errors** - Distinguish permission errors from other failures when creating symlinks in system directories, with actionable warning messages
+
+### Changed
+- **TEST_COVERAGE.md** - Updated export docker status from "full gap" to covered (CI job `test-docker-export` exists); clarified user management gaps column
+
+## [0.32.0] - 2026-02-06
+
+### Added
+- **User management commands** (`spindb users create`, `spindb users list`) - Create database users, API keys, and manage credentials across all supported engines:
+  ```bash
+  spindb users create mydb              # Create user with auto-generated password
+  spindb users create mydb --copy       # Copy connection string to clipboard
+  spindb users create mydb --json               # JSON output for scripting
+  spindb users list mydb                        # List saved credentials
+  ```
+  Supports 13 engines: PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, MongoDB, FerretDB, Redis, Valkey, SurrealDB, CouchDB, Meilisearch, and Qdrant. Credentials saved as `.env.<username>` files in `~/.spindb/containers/{engine}/{name}/credentials/`.
+- **Credential manager** (`core/credential-manager.ts`) - Persistent credential storage with save, load, list, and exists operations
+- **Username validation** - `assertValidUsername()` enforces `^[a-zA-Z][a-zA-Z0-9_]{0,62}$` pattern to prevent SQL injection
+- **Interactive menu integration** - "Create user" option in container submenu under Data Operations
+
+## [0.31.4] - 2026-02-05
+
+### Added
+- **`pnpm generate:db <engine>` scripts** - Create demo databases with sample data for development and testing:
+  ```bash
+  pnpm generate:db postgres   # Create PostgreSQL container with sample data
+  pnpm generate:db mysql      # Create MySQL container with sample data
+  pnpm generate:db mongo      # Create MongoDB container with sample data
+  # ... supports all 16 engines with aliases
+  ```
+  Each script creates a container named `demo-<engine>`, populates it with realistic sample data (users, products, orders), and displays the connection string.
+
+### Changed
+- **Smoother Shift+Tab toggle UX** - When toggling a container's start/stop state with Shift+Tab, the cursor now returns to the same container after the operation completes instead of resetting to the top of the list.
+
+### Fixed
+- **Shift+Tab toggle in container list** - Fixed the keyboard shortcut to start/stop containers which was broken due to separator positioning. Now correctly accesses inquirer's internal state to identify the highlighted container regardless of list position.
+- **Type-to-filter crash in container list** - Fixed crash when typing to filter containers caused by separator being incorrectly included in filterable items.
+- **FerretDB telemetry files in wrong location** - FerretDB now runs with `cwd` set to the container directory, so `telemetry.json` and `state.json` are written there instead of polluting the user's project directory.
+
+## [0.31.3] - 2026-02-04
+
+### Added
+- **Automatic database registry sync** - The `databases` array in container config now automatically syncs with the actual database server:
+  - On `spindb start` - syncs after container starts successfully
+  - After `spindb pull` operations - syncs after restore completes
+  - Manual sync via `spindb databases refresh <container>`
+  - Works on all 16 engines (queries system catalogs, excludes system databases)
+- **`spindb databases refresh` command** - Manually sync the database registry with the actual server state:
+  ```bash
+  spindb databases refresh mydb        # Query server, update registry
+  spindb databases refresh mydb --json # JSON output with changes
+  ```
+- **`listDatabases()` method for all engines** - Each engine now implements `listDatabases()` to query actual databases from the server, excluding system databases (e.g., `template0`/`template1`/`postgres` for PostgreSQL, `information_schema`/`mysql`/`performance_schema`/`sys` for MySQL)
+
+### Changed
+- **Improved test output** - Test scripts now use `--test-reporter=spec` for cleaner hierarchical output with pass/fail summary at the end
+
+### Added
+- **`spindb query` command** - Execute queries against database containers and return results in tabular or JSON format:
+  ```bash
+  spindb query <container> "<query>" [-d database] [--json]
+  ```
+
+  **SQL Engines** (PostgreSQL, MySQL, MariaDB, SQLite, DuckDB, ClickHouse, CockroachDB, QuestDB):
+  ```bash
+  spindb query mypostgres "SELECT * FROM users LIMIT 10"
+  spindb query mypostgres "SELECT * FROM users" --json
+  spindb query mypostgres "SELECT * FROM orders" -d sales
+  ```
+
+  **MongoDB/FerretDB** (JavaScript - auto-prepends `db.` if missing):
+  ```bash
+  spindb query mymongo "users.find({active: true})"
+  spindb query mymongo "db.orders.countDocuments()"
+  ```
+
+  **Redis/Valkey** (Redis commands):
+  ```bash
+  spindb query myredis "KEYS user:*"
+  spindb query myredis "HGETALL session:123"
+  spindb query myvalkey "SMEMBERS active_users"
+  ```
+
+  **SurrealDB** (SurrealQL):
+  ```bash
+  spindb query mysurreal "SELECT * FROM users"
+  spindb query mysurreal "SELECT * FROM products WHERE price > 100"
+  ```
+
+  **REST API Engines** (Qdrant, Meilisearch, CouchDB - format: `METHOD /path [JSON body]`):
+  ```bash
+  spindb query myqdrant "GET /collections"
+  spindb query myqdrant 'POST /collections/movies/points/search {"vector": [0.1, 0.2], "limit": 5}'
+  spindb query mymeili "GET /indexes"
+  spindb query mymeili 'POST /indexes/movies/search {"q": "action"}'
+  spindb query mycouch "GET /_all_dbs"
+  spindb query mycouch 'POST /mydb/_find {"selector": {"type": "user"}}'
+  ```
+
+  **Output formats**:
+  - **Tabular (default)**: Formatted table with column headers
+  - **JSON (`--json`)**: Array of row objects for scripting
+
+## [0.31.1] - 2026-02-03
+
+### Fixed
+- **MongoDB/FerretDB database creation failing** - Fixed `createDatabase` failing with `TypeError: Cannot read properties of undefined (reading 'drop')`. The issue was that mongosh doesn't support shorthand notation (`db._collectionName`) for collection names starting with underscore. Changed to use `db.getCollection("_spindb_init")` instead.
+
+## [0.31.0] - 2026-02-01
+
+### Added
+- **Docker export connection string retrieval** - Get connection strings from existing Docker exports for scripting and automation:
+  ```bash
+  # CLI command for scripting
+  spindb export docker-url mydb                    # Returns connection string
+  spindb export docker-url mydb --copy             # Copy to clipboard
+  spindb export docker-url mydb --json             # JSON with all credentials
+  spindb export docker-url mydb --host myserver    # Override hostname
+  ```
+- **Interactive menu Docker export status** - Export menu now shows:
+  - "Get Docker connection string" option when export exists (copies to clipboard)
+  - "(Re-export - invalidates original credentials)" warning on Docker option when export exists
+
+### Fixed
+- **Docker export container recreation on restart** - Fixed JSON grep pattern to match actual `"name": "..."` format (with space after colon). Containers were being recreated on every restart because the existence check always failed.
+- **Docker export PATH duplication** - PATH setup now checks if entry exists before appending to `.profile`, and uses overwrite for `/etc/profile.d/spindb-bins.sh`
+- **Docker export data re-initialization** - Added initialization marker file (`.initialized-{name}`) so user creation and data restore only run on first start, not on every container restart
+
+### Changed
+- **Documentation updates**:
+  - DEPLOY.md: Added container restart idempotency and `docker exec` examples
+  - CHEATSHEET.md: Added comprehensive "Docker Commands (after export)" section
+
+## [0.30.8] - 2026-02-01
+
+### Fixed
+- **Docker export psql not working inside container** - Fixed `psql` and other database binaries not being accessible inside exported Docker containers via `docker exec bash`. The previous symlink approach broke because binaries like `psql` are wrapper scripts that use `dirname "$0"` for relative path resolution. Now adds the actual bin directory directly to PATH and persists to `~/.profile` and `/etc/profile.d/spindb-bins.sh` for interactive shells.
+
+## [0.30.7] - 2026-02-01
+
+### Fixed
+- **Docker export table permissions** - Automatically grant table/sequence permissions to `spindb` user after restore (tables are owned by `postgres` after restore, now `spindb` user can access them)
+- **Docker export binary symlinks** - Symlink database binaries to `~/.local/bin` so users can run `psql`, `pg_dump`, etc. directly in the container
+
+### Added
+- **Docker deployment documentation** - Comprehensive "EXPORT FOR DOCKER" section in DEPLOY.md with step-by-step guide, schema-only vs full data export options, and deployment instructions
+- **README deployment section** - Added "Deploying Your Container" section explaining Docker export workflow and future plans for Neon/Supabase exports
+
+## [0.30.6] - 2026-02-01
+
+### Fixed
+- **Docker export network connectivity** - PostgreSQL and CockroachDB containers now accept connections from external clients:
+  - Configure `listen_addresses = '*'` in postgresql.conf
+  - Add `host all all 0.0.0.0/0 scram-sha-256` rule to pg_hba.conf
+  - Fix config file path to include `/data/` subdirectory
+- **Docker export user creation** - Use temp file instead of heredoc (spindb run doesn't read from stdin)
+- **Docker export healthcheck** - Fix grep patterns to handle JSON whitespace (`"status": "running"` vs `"status":"running"`)
+- **Restore to primary database** - Remove unnecessary tracking removal during restore overwrite (fixes "Cannot remove primary database from tracking" error)
+
+## [0.30.5] - 2026-02-01
+
+### Changed
+- **Container list toggle hint** - Moved Shift+Tab toggle hint from bottom summary line to a persistent separator at the top of the container list. Now displays as a cyan-colored separator for better visibility.
+
+## [0.30.4] - 2026-02-01
+
+### Changed
+- **Main menu simplified** - Removed Start, Stop, Backup, Restore, and Clone shortcuts from main menu. These operations are now accessed through the Containers list → container submenu. Main menu now shows only: Containers, Create container, Settings, and Exit.
+
+## [0.30.3] - 2026-02-01
+
+### Changed
+- **Container submenu reorganization** - Improved menu layout with labeled section separators:
+  - Separators now show state ("Running", "Stopped", "Available") or required action ("Start container first", "Stop container first")
+  - "View logs" moved to container state section (always accessible, not gated by running status)
+  - "Export" moved to data operations section (logical grouping with backup/restore)
+- **Main menu simplification** - Moved system tasks to Settings submenu:
+  - "Manage engines", "Health check", and "Check for updates" now in Settings
+  - Exit icon changed from ⏻ to ⎋ (ESC symbol) for consistent character width
+- **Post-create navigation** - After creating a container, navigates directly to its submenu instead of returning to main menu
+- **Non-intrusive update notifications** - Update check runs once in background on interactive CLI startup (if enabled). Shows "Update to vX.X.X" option on main menu when new version available. Respects `spindb config update-check off` setting. Never runs during scripts.
+
+### Fixed
+- **Settings menu page size** - Settings prompts now use correct `pageSize` for consistent display
+- **Documentation** - Added `spindb config update-check off` to README and CHEATSHEET
+
+## [0.30.2] - 2026-02-01
+
+### Added
+- **`--force` flag for `spindb create`** - Overwrites existing containers without prompting. Useful for scripting and Docker entrypoints where interactive prompts aren't available. Stops running containers before deletion.
+  ```bash
+  spindb create mydb --engine postgresql --force
+  ```
+
+### Fixed
+- **Docker export container startup** - Fixed multiple issues preventing Docker containers from starting:
+  - Added `libnuma1` dependency required by PostgreSQL binaries on Linux
+  - Added `gosu` for running database processes as non-root user (PostgreSQL refuses to run as root)
+  - Fixed volume permissions with `chown` at container startup
+  - Fixed shell escaping in grep patterns for container status checks
+- **Docker export TLS handling** - TLS is now properly conditional:
+  - Only generates certificates when OpenSSL is available and `--skip-tls` is not set
+  - README now correctly reflects TLS status (no misleading `certs/` references when TLS is disabled)
+  - Dockerfile only includes COPY certs when TLS is enabled
+- **Docker export password safety** - Generated passwords now use alphanumeric characters only to avoid shell/SQL escaping issues. Added runtime validation that fails fast if user-supplied passwords contain problematic characters.
+- **Docker export transaction safety** - Export now checks if output directory pre-exists before registering cleanup rollback, preventing accidental deletion of user directories on failure.
+- **Qdrant stop race condition** - Added 1-second wait after process termination on Linux/macOS to prevent race conditions when checking ports after killing processes.
+- **Windows CI test timeout** - Increased `doctor --json` test timeout from 30s to 60s for slower Windows CI environments.
+
+## [0.30.1] - 2026-01-31
+
+### Changed
+- **Static imports refactoring** - Converted unnecessary dynamic `await import()` patterns to static imports across 12 files. Improves module load time and code clarity. No functional changes.
+- **Self-update verification** - After updating, runs `spindb --version` in a new process to verify the update worked. Replaces the confusing "restart your terminal" message with immediate confirmation.
+
+### Fixed
+- **Self-update false failure with fnm/nvm** - Fixed issue where self-update reported failure even when install succeeded. The verification step (`npm list -g`) could fail with stale cwd errors when using Node version managers. Install and verification are now separate, and verification uses fallbacks.
+
+## [0.30.0] - 2026-01-31
+
+### Added
+- **`spindb export docker` command** - Export a local SpinDB container to a Docker-ready package:
+  ```bash
+  spindb export docker myapp
+  # Generates: ./myapp-docker/
+  #   ├── Dockerfile
+  #   ├── docker-compose.yml
+  #   ├── .env (auto-generated credentials)
+  #   ├── certs/ (TLS certificates)
+  #   ├── data/ (database backup)
+  #   ├── entrypoint.sh
+  #   └── README.md
+  ```
+  - **All 16 engines supported** - PostgreSQL, MySQL, MariaDB, MongoDB, FerretDB, Redis, Valkey, ClickHouse, SQLite, DuckDB, Qdrant, Meilisearch, CouchDB, CockroachDB, SurrealDB, QuestDB
+  - **Multi-database export** - Containers with multiple databases export all databases by default
+  - **TLS enabled by default** - Auto-generates self-signed certificates for secure connections
+  - **Credential generation** - Auto-generates shell-safe passwords (avoids problematic characters like `#$&*?`)
+  - **Port selection** - Interactive prompt when local port differs from engine default
+  - **JSON output** - `--json` flag for scripting
+- **"Export" menu option** - Available in the interactive container menu with submenu for export formats (currently Docker, extensible for future deployment targets)
+
+## [0.28.2] - 2026-01-31
+
+### Fixed
+- **Version-matched backup/restore binaries** - `pg_dump`, `pg_restore`, `psql`, `mysqldump`, `mysql`, `mongodump`, and `mongorestore` now use the same version as the container being backed up/restored. Previously, a version mismatch (e.g., pg_dump v17 with PostgreSQL 18 container) would cause "server version mismatch" errors. The fix implements a fallback chain: exact version match → major version match → globally cached binary → system binary.
+
+## [0.28.1] - 2026-01-29
+
+### Added
+- **Type-to-filter in container selection** - Container list prompts now support typing to filter by name
+- **Type-to-filter in restore container selection** - Restore workflow container selection now supports filtering
+- **Shift+Tab to toggle containers** - Press Shift+Tab on the container list to start/stop the highlighted container without entering its menu
+
+### Changed
+- **Container menu reorganized into 4 sections** - Clearer grouping: (1) Start/Stop & database selection, (2) Data operations (shell, run, copy URL, backup, restore, logs), (3) Container management (edit, clone, delete), (4) Navigation
+- **Port conflict UX improved** - Instead of "Press Enter to continue", now shows actionable dropdown: update to next available port and start, go back, or return to main menu
+- **Container list prompt hints updated** - Shows `(↑↓ pick, type to filter)` at top, `Shift+Tab: Toggle` at bottom for clearer instructions
+- **CI workflow improvements**:
+  - Disabled `fail-fast` so all matrix jobs run even when one fails
+  - Clearer platform labels: `Linux x64 22.04`, `macOS ARM64`, `Win x64` instead of `Ubuntu 22`, `ARM`, `Windows`
+- **`spindb which` command improvements**:
+  - JSON output is now pretty-printed with indentation
+  - Invalid `--engine` values now show helpful error with list of valid options
+  - Unrecognized URL protocols now error instead of defaulting to port 5432
+
+### Fixed
+- **SQL injection in `terminateConnections`** - Database names are now validated in PostgreSQL, MySQL, and MariaDB before use in SQL queries
+- **Pull command backup format** - Now uses engine-appropriate format instead of hardcoded PostgreSQL `custom` format
+- **Redis/Valkey shell database parameter** - Shell now correctly uses the passed database parameter
+- **Documentation fixes** - Markdown lint issues in CHEATSHEET.md, ENGINE_CHECKLIST.md, and CLONE_FEATURE.md
+
+### Documentation
+- Added `spindb pull` command examples to README "Pull from Remote Database" section
+- Added custom keyboard shortcut pattern documentation to CLAUDE.md for future development
+
+## [0.28.0] - 2026-01-29
+
+### Added
+- **`spindb pull` command** - Pull remote database data into a local container with automatic backup:
+  ```bash
+  # Replace mode: backup original, pull remote data (connection string unchanged)
+  spindb pull myapp --from postgresql://user:pass@prod.example.com/db
+
+  # Read URL from environment variable (keeps credentials out of shell history)
+  spindb pull myapp --from-env CLONE_FROM_DATABASE_URL
+
+  # Clone mode: create new database with remote data
+  spindb pull myapp --from-env PROD_DB_URL --as mydb_prod
+
+  # Preview changes without executing
+  spindb pull myapp --from-env PROD_DB_URL --dry-run
+
+  # Run post-pull script (e.g., credential sync)
+  spindb pull myapp --from-env PROD_DB_URL --post-script ./sync-credentials.ts
+  ```
+  - **Replace mode** (default): Backs up original database with timestamp, pulls remote data into original database name - your connection string never changes
+  - **Clone mode** (`--as`): Pulls remote data into a new database, leaves original untouched
+  - **JSON output** with `--json` returns `databaseUrl` and `backupUrl` for scripting
+  - **Post-pull scripts** receive context via `SPINDB_CONTEXT` JSON file (container, database, backupDatabase, port, engine)
+  - Supports PostgreSQL, MySQL, and MariaDB (more engines planned)
+- **`spindb which` command** - Find containers by port or connection URL for scripting:
+  ```bash
+  spindb which --port 5432              # Find container on port 5432
+  spindb which --url "$DATABASE_URL"    # Find container matching URL
+  CONTAINER=$(spindb which --port 5432) # Use in scripts
+  ```
+- **`terminateConnections()` engine method** - Safely disconnect clients before dropping databases (PostgreSQL, MySQL, MariaDB)
+- **`databases set-default` command** - Change the default/primary database for a container: `spindb databases set-default mydb prod`
+- **`databases list --default` flag** - Show only the default database name: `spindb databases list mydb --default` outputs just `efficientdb`
+- **`databases list` all containers** - Running without a container argument now lists all containers with their databases
+- **Database selection in container menu** - Containers with multiple databases now show a "Set database" option to select which database to operate on
+- **Dynamic menu page sizing** - Menu lists now adapt to terminal height (20 items for tall terminals, 15 for shorter)
+
+### Changed
+- **Menu UI improvements**:
+  - Container submenu header simplified to `🐘 container → database` format (respects icon preference)
+  - Database-specific actions (shell, backup, restore, copy URL) now require database selection for multi-database containers
+  - "Set database" menu item shows current selection and count: `Set database | Current: efficientdb (1 of 2)`
+  - Disabled menu items show clear hints (e.g., "Select database first", "Start container first")
+- **JSON output** - All `--json` output is now pretty-printed with indentation for readability
+- **Documentation reorganization**:
+  - README: Platform matrix moved to top with cleaner "Type" column, comparison tables split by category
+  - Deleted redundant ENGINES.md (content consolidated in README and engines.json)
+  - Moved MIGRATION.md to docs/historical-refactor-notes/ for historical reference
+  - Updated ARCHITECTURE.md with SurrealDB, QuestDB details
+  - Added `spindb pull` and `spindb which` commands to CHEATSHEET.md
+  - New plans/CLONE_FEATURE.md tracking engine support for pull command
+
+### Fixed
+- **Double parentheses in disabled menu items** - Fixed menu items showing "(Stop container first) (Disabled)" by passing hint to inquirer's disabled property directly
+- **SurrealDB history.txt pollution** - SurrealDB shell now writes history to container directory instead of user's working directory
+
+## [0.27.6] - 2026-01-28
+
+### Fixed
+- **JSON error handling in `url` command** - `spindb url --json` without a container argument now outputs JSON error and exits 1 instead of trying to prompt interactively
+- **JSON error handling in `info` command** - `spindb info <name> --json` for nonexistent container now correctly outputs JSON error instead of returning empty array
+
+## [0.27.5] - 2026-01-28
+
+### Added
+- **Configurable icon modes** - Engine icons now support three display modes via `SPINDB_ICONS` environment variable or `spindb config icons`:
+  - `ascii` (default): `[PG]`, `[MY]`, etc. - works in any terminal
+  - `nerd`: Nerd Font glyphs - requires a [patched font](https://nerdfonts.com)
+  - `emoji`: Original emoji icons
+- **Settings menu** - New "Settings" option in main menu for configuring icon mode preference
+- **Doctor preferences check** - `spindb doctor` now verifies icon mode is configured and offers auto-fix
+- **JSON output tests** - Added tests to ensure all `--json` commands output valid parseable JSON
+
+### Fixed
+- **--json flag on engine subcommands** - Fixed `spindb engines supported --json` and other subcommands not outputting JSON (flags were consumed by parent command)
+
+### Changed
+- **Consolidated documentation** - Combined FEATURE.md and CHECKLIST.md into single ENGINE_CHECKLIST.md (~2,600 lines)
+- **Removed obsolete docs** - Deleted evaluations/ directory and plans/FERRETDB.md (content moved to ENGINE_CHECKLIST.md or obsolete)
+
+## [0.27.4] - 2026-01-28
+
+### Changed
+- **Removed deprecated function** - Removed `getEngineIconPadded()` alias; use `getEngineIcon()` directly
+
+## [0.27.3] - 2026-01-28
+
+### Fixed
+- **Main Menu** - Updated verbiage in main menu
+
+## [0.27.2] - 2026-01-27
+
+### Fixed
+- **Emoji alignment in CLI** - Fixed inconsistent emoji widths across terminals (VS Code, Ghostty, iTerm2) by detecting terminal and applying appropriate padding
+- **Removed variation selectors** - Stripped U+FE0F from couchdb (🛋) and questdb (⏱) emojis that caused rendering inconsistencies
+
+### Changed
+- **Centralized emoji handling** - All engine icons now use `getEngineIcon()` from `cli/constants.ts` with terminal-aware padding
+- **Removed duplicate code** - Eliminated `padWithEmoji()` functions and hardcoded emojis across CLI commands
+- **Documentation** - Added engine icon guidelines to STYLEGUIDE.md and updated FEATURE.md
+
+## [0.27.1] - 2026-01-27
+
+### Fixed
+- **QuestDB PID handling** - Fixed process tracking for JRE-based engines where shell script forks and exits immediately; now finds actual Java process by port after startup
+- **QuestDB multi-port conflicts** - All 4 QuestDB ports (PG, HTTP, HTTP Min, ILP) now configured uniquely per container via environment variables, fixing "could not bind socket" errors when running multiple containers
+- **QuestDB backup format** - Fixed SQL export: use double quotes for identifiers, avoid double semicolons, don't quote numeric values, detect designated timestamp column dynamically
+- **QuestDB binary extraction** - Preserve QuestDB's unique directory structure (questdb.sh at root) instead of incorrectly moving it to bin/ subdirectory
+
+### Added
+- **Cross-engine dependency warning** - Deleting PostgreSQL now warns if QuestDB containers exist (psql required for backup/restore/shell)
+
+### Changed
+- Updated documentation (CLAUDE.md, FEATURE.md, CHECKLIST.md, ENGINES.md, README.md) with JRE/shell script engine patterns and cross-engine dependency notes
+
+## [0.27.0] - 2026-01-26
+
+### Added
+- **QuestDB engine support** - Full integration for QuestDB time-series database:
+  - High-performance time-series database optimized for fast ingestion
+  - PostgreSQL wire protocol on port 8812, Web Console at port 9000
+  - Default credentials: `admin`/`quest`
+  - Single database model (`qdb`)
+  - SQL-based backup/restore via bundled PostgreSQL tools (psql, pg_dump)
+  - Java-based with bundled JRE (no Java installation required)
+  - Version 9 from hostdb
+  - Aliases: `questdb`, `quest`
+  - Full cross-platform support (macOS, Linux, Windows)
+
+### Fixed
+- **QuestDB emoji** - Use stopwatch emoji (⏱️) with variation selector for consistent terminal width rendering
+
+## [0.26.2] - 2026-01-26
+
+### Fixed
+- **Windows spawn reliability** - CockroachDB and SurrealDB now use a fixed delay instead of unreliable `spawn` event on Windows, fixing 30-second spawn timeouts
+- **CockroachDB startup cleanup** - Failed startups now properly kill orphaned processes and remove PID files
+- **CockroachDB credential security** - Connection strings are sanitized in error messages to prevent credential exposure
+- **CockroachDB table discovery** - Now uses CSV parser to properly handle quoted table identifiers
+- **CockroachDB PID file handling** - PID file write failure on Windows is now fatal (kills process, throws error)
+- **SurrealDB error messages** - Removed misleading "Check logs at" reference since no logs are written
+- **SurrealDB PID file handling** - PID file write failure on Windows is now fatal (kills process, throws error)
+- **SurrealDB import signal handling** - Signal termination (code === null) now properly treated as error
+
+### Changed
+- Windows tests now run in parallel across engine matrices instead of sequentially
+- Removed redundant Windows tests from Fresh Install and Upgrade jobs
+
+## [0.26.1] - 2026-01-26
+
+### Fixed
+- **SurrealDB backup signal handling** - Backup close handler now properly treats `code === null` as signal termination error instead of success
+- **SurrealDB credential security** - Connection strings are now sanitized in error messages to prevent credential leaks
+- **SurrealDB health check** - `waitForReady` now returns false when binary is not found instead of incorrectly assuming success
+- **SurrealDB history file location** - `surreal sql` commands now use container directory as cwd so `history.txt` is stored in `~/.spindb/containers/surrealdb/<name>/` instead of polluting the user's working directory
+- **Docker E2E SurrealDB tests** - Fixed verify-seed to use correct database name ("test" not "testdb") and corrected misleading restore comment
+
+### Changed
+- Updated README engine count from 14 to 15 to reflect SurrealDB addition
+
+## [0.26.0] - 2026-01-26
+
+### Added
+- **SurrealDB engine support** - Full integration for SurrealDB multi-model database:
+  - Multi-model database supporting documents, graphs, and relational data
+  - Default port 8000, version 2.3.2 from hostdb
+  - SurrealQL-based backup/restore via `surreal export` and `surreal import`
+  - Default user `root` with password `root`, namespace/database structure
+  - WebSocket connection scheme (`ws://`)
+  - Single binary: `surreal`
+  - Aliases: `surrealdb`, `surreal`
+  - Full cross-platform support (macOS, Linux, Windows)
+
+### Fixed
+- **CockroachDB CSV backup parsing** - Fixed empty string vs NULL handling in SQL backups. Quoted empty strings are now preserved as empty strings, while unquoted empty strings become SQL NULL
+- **CockroachDB health check** - `waitForReady` now properly returns false when binary is not found instead of incorrectly assuming success
+- **CockroachDB binary lookup** - `dumpFromConnectionString` now tries multiple methods to locate the cockroach binary (config keys, dependency manager, downloaded versions)
+- **CockroachDB port conflict test** - Integration test now actually starts the container to verify port conflict behavior
+- Added CockroachDB and SurrealDB to `spindb engines download` command
+
+### Changed
+- Centralized test version constants in `tests/integration/helpers.ts` (`TEST_VERSIONS.cockroachdb`, `TEST_VERSIONS.surrealdb`)
+
+## [0.25.0] - 2026-01-25
+
+### Added
+- **CockroachDB engine support** - Full integration for CockroachDB distributed SQL database:
+  - PostgreSQL wire protocol compatible (uses `postgresql://` connection scheme)
+  - Default port 26257, HTTP admin UI on port+1
+  - SQL-based backup/restore via `cockroach sql` and `cockroach dump`
+  - Default user `root`, default database `defaultdb`
+  - Version 25.4.2 from hostdb
+  - Single binary: `cockroach`
+  - Aliases: `cockroachdb`, `crdb`
+  - Full cross-platform support (macOS, Linux, Windows)
+
+## [0.24.0] - 2026-01-25
+
+### Added
+- **CouchDB engine support** - Full integration for CouchDB document database:
+  - REST API-based engine (like Qdrant and Meilisearch)
+  - Default port 5984, version 3.5.1 from hostdb
+  - JSON-based backup/restore via `_all_docs` and `_bulk_docs` REST API endpoints
+  - Fauxton dashboard opens at `/_utils` in browser via `spindb connect`
+  - Uses "databases" for data organization
+  - Health check at `/` endpoint (returns welcome JSON with version)
+  - Aliases: `couchdb`, `couch`
+  - Full cross-platform support (macOS, Linux, Windows)
+
+## [0.23.5] - 2026-01-24
+
+### Fixed
+- Re-sign FerretDB and postgresql-documentdb binaries on macOS after download to fix Gatekeeper code signature issues
+
+### Changed
+- Improved error message when postgresql-documentdb binaries fail to execute due to library loading issues
+
+## [0.23.4] - 2026-01-23
+
+### Fixed
+- FerretDB binary downloads now skip already-installed components and clean up partial installations
+- FerretDB engine deletion now also removes the postgresql-documentdb backend
+- Added ENOTEMPTY to filesystem fallback errors for better extraction handling
+
+## [0.23.3] - 2026-01-23
+
+### Fixed
+- Added FerretDB to interactive engines menu
+
+## [0.23.2] - 2026-01-23
+
+### Fixed
+- Added FerretDB to `--engine` help text in create command
+- Added FerretDB to Docker E2E test suite
+
+## [0.23.1] - 2026-01-23
+
+### Changed
+- **FerretDB Windows binaries added** - hostdb now provides win32-x64 builds for ferretdb and postgresql-documentdb, completing cross-platform support
+
+## [0.23.0] - 2026-01-23
+
+### Added
+- **FerretDB engine support** - MongoDB-compatible database using PostgreSQL as backend:
+  - First composite engine requiring two binaries: `ferretdb` proxy + `postgresql-documentdb` backend
+  - Two processes per container: PostgreSQL backend + FerretDB proxy
+  - Two ports per container: external (27017 for MongoDB) + internal (54320+ for PostgreSQL)
+  - Uses `mongodb://` connection scheme, compatible with mongosh
+  - Backup/restore via pg_dump/pg_restore on PostgreSQL backend (formats: `sql`, `custom`)
+  - Aliases: `ferretdb`, `ferret`
+  - Supported architectures: darwin-arm64, darwin-x64, linux-arm64, linux-x64 (win32-x64 added in 0.23.1)
+  - Version 2.7.0 with postgresql-documentdb 17-0.107.0 from hostdb
+
+### Changed
+- **Port allocation for stopped containers** - Stopped containers no longer block port suggestions when creating new containers. Previously, a stopped MongoDB container on port 27017 would cause new containers to suggest 27018. Now only running containers are considered port conflicts, giving users more control over port management.
+
+## [0.22.1] - 2026-01-23
+
+### Changed
+- Updated documentation
+
+## [0.22.0] - 2026-01-22
+
+### Added
+- **Meilisearch engine support** - Full integration for Meilisearch full-text search engine:
+  - REST API-based engine (like Qdrant)
+  - Default port 7700, version 1.33.1 from hostdb
+  - Snapshot-based backup/restore via REST API (`POST /snapshots`)
+  - Dashboard opens at root URL (/) in browser via `spindb connect`
+  - Uses "indexes" instead of traditional databases (index UID auto-converted from container name with dashes → underscores)
+  - Health check at `/health` endpoint
+  - Aliases: `meilisearch`, `meili`, `ms`
+  - Full cross-platform support (macOS, Linux, Windows)
+
+## [0.21.3] - 2026-01-21
+
+### Fixed
+- **Qdrant start command hang on Linux** - Fixed `spindb start` not exiting on Linux/Docker due to piped stdio streams keeping Node.js event loop alive. Now uses `['ignore', 'ignore', 'ignore']` stdio on non-Windows platforms (matching MySQL/MariaDB pattern)
+- **Qdrant snapshot path** - Fixed snapshot storage location by explicitly setting `snapshots_path` in Qdrant config to `{dataDir}/snapshots`, ensuring backups are created and found in the expected location. Also ensures snapshots directory is created during container initialization and startup
+- **Redis/Valkey database validation** - Now throws RangeError for invalid database numbers outside 0-15 range instead of silently defaulting to 0
+- **Redis/Valkey shell escaping** - Fixed POSIX quoting for values containing single quotes using standard `'...'\''..'` pattern
+- **JSON error format consistency** - Removed redundant `success: false` from restore command error output to match other commands
+- **Version sorting edge case** - Fixed handling of non-numeric version segments (e.g., "1.0.0-beta") which previously caused NaN comparison issues
+- **SQL handlers casing** - Fixed inconsistent casing in script type terminology (`'SQL'` → `'sql'`)
+
+### Changed
+- **Redis/Valkey password security** - Password now passed via `REDISCLI_AUTH` environment variable instead of `-a` command-line flag to avoid exposure in process listings
+- **Redis/Valkey remote timeout** - Added 30-second timeout to remote commands to prevent indefinite hanging on unresponsive servers
+- **Qdrant remote timeout** - Added AbortController-based timeout handling to `remoteQdrantRequest` (30s default)
+- **Qdrant API info menu** - Added distinct `'api-info'` ShellChoice, separated from `'browser'` for clearer intent
+- **Shell handlers imports** - Converted dynamic imports (`paths`, `fs/promises`) to static imports for consistency
+- **Shell handlers path resolution** - Replaced `join(targetPath, '..')` with `dirname(targetPath)` for clarity
+
+### Improved
+- **Qdrant listSnapshots performance** - Parallelized `stat()` calls using `Promise.all` for better performance with many snapshots
+- **Engine handlers documentation** - Enhanced comment explaining reverse-parsing strategy for Windows paths with colons
+- **Test output cleanup** - Removed verbose `[DEBUG]` logs from PostgreSQL integration tests for cleaner output
+
+### Added
+- **`spindb databases` command** - New CLI command for managing database tracking within containers:
+  - `spindb databases list <container>` - List tracked databases
+  - `spindb databases add <container> <database>` - Add database to tracking
+  - `spindb databases remove <container> <database>` - Remove database from tracking
+  - `spindb databases sync <container> <old> <new>` - Sync tracking after SQL rename operations
+  - All subcommands support `--json` flag for scripting
+  - Useful for keeping SpinDB's registry in sync after external changes (SQL renames, scripts that create/drop databases)
+
+- **PostgreSQL self-healing binary resolution** - Containers now automatically recover from missing binaries:
+  - If exact version binaries are missing, SpinDB finds compatible binaries with the same major version
+  - If no compatible binaries exist, prompts to download the current supported version for that major
+  - Container config is automatically updated to reflect the actual version used
+  - Prevents ENOENT errors when binaries are deleted or moved
+  - Start command now checks for any compatible binaries (same major version) instead of requiring exact version match
+
+## [0.21.2] - 2026-01-21
+
+### Fixed
+- **JSON output pollution** - Update notification banner no longer appears before JSON output when using `--json` flag. The banner now only displays once when entering the interactive menu.
+- **JSON error handling** - Commands with `--json` flag now output proper JSON for error cases instead of human-readable messages:
+  - `info` - Empty containers returns `[]`, not found returns `{ "error": "..." }`
+  - `create` - Validation errors (invalid format, missing tools, etc.) return JSON
+  - `list` - Errors return JSON
+  - `start` - No containers, not found, already running errors return JSON
+  - `stop` - No running containers, not found, not running errors return JSON
+  - `delete` - No containers, not found, running errors return JSON; skips confirmation prompt in JSON mode
+  - `backup` - No containers, not running, invalid format errors return JSON
+  - `restore` - No containers, not running errors return JSON
+
+### Changed
+- **Update notification style** - Simplified from bordered box to clean header lines for better terminal compatibility
+
+## [0.21.1] - 2026-01-21
+
+### Added
+- **Universal remote dump support** - All engines now support `dumpFromConnectionString()` for `spindb restore --from-url`:
+  - **Redis/Valkey** - Scans all keys from remote server, exports data types (strings, hashes, lists, sets, sorted sets) with TTL preservation
+  - **ClickHouse** - Uses HTTP API to fetch schema and export data as SQL INSERT statements
+  - **Qdrant** - Creates snapshot on remote server, downloads it, then cleans up
+- **FEATURE.md improvements** - Comprehensive documentation for adding REST API engines:
+  - REST API engine sub-type documentation
+  - Connection string validation guidance for backup-handlers.ts
+  - Flat archive handling for server-based engines
+  - Docker E2E test patterns for curl-based testing
+
+### Changed
+- **Engine management menu UX** - Replaced grouped engine list with flat selectable list showing all installed engines. Added interactive submenu for individual engine management (delete, back navigation).
+- **Binary manager flat archive handling** - `BaseBinaryManager.moveExtractedEntries()` now correctly handles flat archives (executables at root) for both Unix and Windows, creating `bin/` subdirectory structure as needed
+- **engines.schema.json** - Added "rest" to `queryLanguage` enum for REST API engines
+
+### Fixed
+- **Qdrant API response parsing** - Fixed JSON parsing errors for non-JSON endpoints like `/healthz`
+- **Qdrant "Run SQL file" menu option** - Hidden for Qdrant since it uses REST API, not CLI
+- **Connection string validation** - Added validation for all engines (Qdrant, ClickHouse, Redis, Valkey, MariaDB) in restore menu handlers
+
+### Notes
+- Integration tests for `dumpFromConnectionString()` are pending remote database test infrastructure
+- Docker E2E backup/restore tests skipped for Qdrant (covered by integration tests)
+
+## [0.21.0] - 2026-01-21
+
+### Added
+- **Qdrant engine support** - Full container lifecycle for Qdrant, the vector similarity search engine
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - Version 1 supported (1.16.3 from hostdb)
+  - Default port 6333 (REST/HTTP), gRPC port 6334
+  - Uses `http://` connection scheme for REST API
+  - Backup format: `.snapshot` (Qdrant native snapshot)
+  - Collections-based data model (no traditional databases)
+  - Full integration tests across all platforms in CI
+  - Docker E2E tests included
+  - Apache-2.0 licensed
+- **Qdrant in Manage Engines menu** - Can now download, list, and delete Qdrant engine versions
+
+### Notes
+- Qdrant uses REST API for all operations (no CLI shell like psql/mysql)
+- Connect shows API endpoint information instead of launching a shell
+- Backup/restore uses Qdrant's snapshot API
+
+## [0.20.1] - 2026-01-20
+
+### Added
+- **Docker E2E rename and clone tests** - Extended `pnpm test:docker` to test container rename and clone operations for all server-based engines. Tests verify data persists after rename/clone.
+- **Docker E2E idempotency tests** - Added tests for double-start and double-stop operations to verify they warn but don't error.
+- **GH Actions rename/clone tests** - Added `test-rename-clone` job testing PostgreSQL rename and clone on Ubuntu, macOS, and Windows.
+- **GH Actions ClickHouse rename test** - Added `test-clickhouse-rename` job specifically testing ClickHouse config.xml path regeneration on Ubuntu and macOS.
+- **CLI E2E URL command tests** - Added tests for `spindb url` command including `--json` output.
+- **CLI E2E connection string tests** - Added tests for `spindb create --from <connection-string>` engine inference.
+- **MariaDB version validator tests** - Added unit tests for `parseVersion`, `extractDumpVersion`, and `validateRestoreCompatibility`.
+- **MongoDB version validator tests** - Added unit tests for `parseVersion`, `compareVersions`, `isVersionCompatible`, and `getMajorMinorVersion`.
+- **ClickHouse version validator tests** - Added unit tests for `parseVersion`, `compareVersions`, `getMajorVersion`, `isVersionSupported`, and `isVersionCompatible`.
+
+### Fixed
+- **ClickHouse data loss after rename/clone** - Fixed ClickHouse containers appearing to lose data after rename or clone. The `config.xml` file contained hardcoded absolute paths that weren't updated when the container directory moved. Added `regenerateConfig()` method that rewrites `config.xml` with correct paths after rename/clone operations.
+
+## [0.20.0] - 2026-01-20
+
+### Breaking Changes
+- **Removed `--sql` and `--dump` shorthand flags** - The `spindb backup` command no longer accepts `--sql` or `--dump` flags. Use `--format <format>` with engine-specific format names instead.
+- **Engine-specific backup format names** - Each engine now has semantically meaningful format names instead of universal `sql`/`dump`:
+
+  | Engine | Formats | Default |
+  |--------|---------|---------|
+  | PostgreSQL | `sql`, `custom` | `sql` |
+  | MySQL/MariaDB | `sql`, `compressed` | `sql` |
+  | SQLite/DuckDB | `sql`, `binary` | `binary` |
+  | MongoDB | `bson`, `archive` | `archive` |
+  | Redis/Valkey | `text`, `rdb` | `rdb` |
+  | ClickHouse | `sql` | `sql` |
+
+### Added
+- **Docker E2E data lifecycle tests** - Extended `pnpm test:docker` to test full backup/restore cycles for all engines. Tests now seed data, create backups in multiple formats, restore to new databases, and verify data integrity.
+- **Self-update E2E test in Docker** - Added `pnpm test:docker -- self-update` to test the update command in a clean Linux environment.
+- **Engine-specific backup format types** - Added `PostgreSQLFormat`, `MySQLFormat`, `MongoDBFormat`, `RedisFormat`, etc. type definitions in `types/index.ts` for type-safe format handling.
+- **Format validation helpers** - Added `isValidFormat()` and `getValidFormats()` functions in `config/backup-formats.ts` for engine-aware format validation.
+
+### Changed
+- **backup-formats.ts refactored** - Complete restructure with dynamic format keys per engine. Uses `formats: Record<string, BackupFormatInfo>` instead of hardcoded `sql`/`dump` keys.
+- **backup-formats.ts uses Engine enum** - Keys in `BACKUP_FORMATS` now use `[Engine.PostgreSQL]:` bracket notation instead of string literals for better type safety.
+- **CLI format validation** - The backup command now validates format names against the engine's supported formats and provides helpful error messages listing valid options.
+
+### Fixed
+- **SQLite/DuckDB restore in Docker** - Fixed SQL file restore failing silently in Docker. Changed from `-init` flag approach to explicit `stdin.end(fileContent)` which works reliably across macOS and Linux.
+- **DuckDB SQL dump table names** - Fixed `.mode insert` producing `INSERT INTO "table"` instead of actual table name. Now uses `.mode insert <tablename>` for each table.
+- **SQLite/DuckDB restore prompts** - Fixed restore command prompting for database name on file-based engines. Now uses container name directly since the file IS the database.
+- **SQLite/DuckDB container tracking** - Fixed restore failing with "container.json not found" by skipping `containerManager.addDatabase()` for file-based engines which use registry instead.
+- **SQLite/DuckDB default backup format** - Fixed fallback format defaulting to `'dump'` instead of `'binary'` for file-based engines.
+- **MariaDB backup extension** - Fixed backup command producing `.dump` instead of `.sql.gz` for MariaDB compressed backups. Added missing `mariadb` case in `getExtension()`.
+- **Docker E2E DuckDB count parsing** - Fixed count extraction matching "64" from "int64" column type instead of actual row count.
+- **Redis/Valkey backup format checks** - Fixed format comparisons using `'sql'` instead of `'text'` in backup implementations.
+- **MongoDB backup format checks** - Fixed format comparisons using `'dump'` instead of `'archive'` in backup and clone implementations.
+- **ClickHouse backup portability** - Fixed backup SQL containing hardcoded database names (e.g., `CREATE TABLE testdb.test_user`) which prevented restoring to different target databases. Backups now generate portable SQL without database prefixes.
+- **Redis/Valkey backup and restore format names** - Updated backup and restore modules to return `format: 'text'` instead of `format: 'redis'` or `format: 'valkey'` for consistency with the new semantic format naming.
+
+## [0.19.7] - 2026-01-20
+
+### Added
+- **MySQL 9.1 support** - Added MySQL 9.1.0 to version maps and supported versions.
+
+### Changed
+- **PostgreSQL now uses BaseServerBinaryManager** - Refactored PostgreSQL binary management to use the same base class as MySQL, MariaDB, Redis, Valkey, and ClickHouse. This consolidates ~600 lines of PostgreSQL-specific code into a ~40-line subclass.
+- **PostgreSQL Windows binaries from hostdb** - Windows PostgreSQL binaries now download from hostdb instead of EnterpriseDB (EDB). All platforms now use a unified download source.
+- **PostgreSQL client tools bundled** - Client tools (psql, pg_dump, pg_restore) are now bundled in hostdb downloads for all platforms, removing the need for system package manager fallbacks.
+- **Platform/Arch enums** - Introduced `Platform` and `Arch` enums in `types/index.ts` for type-safe platform and architecture checks. Refactored all string literal comparisons (`'darwin'`, `'linux'`, `'win32'`, `'arm64'`, `'x64'`) to use enum values across the codebase.
+- **Engine enum keys** - `engineDefaults` now uses `Engine` enum values as keys (`[Engine.PostgreSQL]`) instead of string literals for better type safety.
+- **Version source consolidation** - Removed duplicated `supportedVersions` from `engineDefaults`. Engines now use `SUPPORTED_MAJOR_VERSIONS` from their respective `version-maps.ts` files as the single source of truth.
+- **Logging cleanup** - Changed `console.warn` to `logDebug` in all engine version-maps.ts files to avoid polluting stdout/stderr.
+- **Type safety improvements** - Added `isValidEngine()` type guard for safer engine validation. Removed unsafe `as Engine` casts.
+
+### Fixed
+- **PostgreSQL version verification** - Fixed version parsing for hostdb PostgreSQL binaries which output `postgres (PostgreSQL) X.Y - Percona Server for PostgreSQL X.Y.Z`. The base class regex expected MySQL/MariaDB format; PostgreSQL now overrides `verify()` with its own format-specific parser.
+- **SQLite/DuckDB version fallback** - `getLatestVersion()` now falls back to a sensible major-based version when hostdb or version maps lack an entry, instead of throwing.
+- **Partial install cleanup** - MariaDB and MongoDB binary downloads now remove `binPath` on failure to avoid leaving partially extracted installs.
+
+### Removed
+- **Dead code** - Removed unused `getPostgresHomebrewBinPath()` function from `engine-defaults.ts`.
+- **Obsolete PostgreSQL files** - Removed `core/binary-manager.ts` (PostgreSQL-specific, replaced by base class) and `engines/postgresql/edb-binary-urls.ts` (no longer needed since hostdb hosts Windows binaries).
+- **Zonky.io fallback code** - Removed legacy fallback code in PostgreSQL engine that installed client tools via system package managers.
+
+## [0.19.4] - 2026-01-19
+
+### Fixed
+- **Self-update now uses correct package manager** - The `spindb update` command now detects which package manager (npm, pnpm, yarn, or bun) was used to install spindb and uses the same one for updates. Previously it always used npm, which failed when spindb was installed with a different package manager.
+
+### Added
+- **Self-update E2E test in CI** - New GitHub Actions job that installs spindb@0.19.4 via pnpm and verifies `spindb update -y` works correctly. Runs on PRs to main and via manual workflow dispatch.
+
+## [0.19.3] - 2026-01-19
+
+### Changed
+- **README rewrite** - Completely rewrote README.md with stronger value proposition positioning SpinDB as a universal database management tool:
+  - New tagline: "One CLI for all your local databases"
+  - Added "What is SpinDB?" section defining three core capabilities: database package manager, unified API, and native client
+  - Prominent platform coverage table showing 9 engines × 5 platforms = 45 combinations
+  - Reframed "Why SpinDB?" to focus on unique strengths rather than defending against Docker
+  - Better structure: Quick Start → Why → Commands → Engines → Advanced
+  - Stronger examples showing multi-engine/multi-version workflows
+  - Emphasizes universality: one consistent API across SQL, NoSQL, key-value, and analytics engines
+  - Comprehensive comparison matrix with Docker, DBngin, Postgres.app, and XAMPP
+  - Improved organization while preserving all technical depth
+
+## [0.19.2] - 2026-01-18
+
+### Fixed
+- **DuckDB engine inference** - Removed `.db` extension from DuckDB file detection. This extension is commonly used by SQLite, so inferring DuckDB was causing misidentification. Now only `.duckdb` and `.ddb` trigger DuckDB inference.
+- **DuckDB engines display** - Fixed `spindb engines list` showing DuckDB as "system-installed" even when downloaded from hostdb. Now correctly displays platform, architecture, and size like other engines.
+- **DuckDB container rename** - Fixed rename leaving orphaned container directories. Now properly moves the directory before updating the registry (matching SQLite behavior).
+- **DuckDB registry race conditions** - Added file-based locking for registry mutations to prevent corruption when multiple processes access the registry concurrently.
+- **DuckDB SQL dump escaping** - Fixed potential SQL injection in table names by properly escaping embedded double quotes during backup.
+- **ClickHouse multiquery support** - Added `--multiquery` flag to ClickHouse client for running scripts with multiple statements.
+- **ClickHouse test reliability** - Improved `waitForMutationsComplete` to distinguish transient errors (connection refused, network issues) from unexpected errors, reducing flaky test failures.
+- **DuckDB test isolation** - Fixed tests using shared directory that could cause conflicts. Each test run now uses a unique timestamped directory.
+
+### Changed
+- **DuckDB version display** - Updated CLAUDE.md to show full version "1.4.3" instead of just "1" in the Supported Versions table.
+- **DuckDB version validation** - `compareVersions()` now throws `TypeError` for invalid version strings instead of silently returning 0. Renamed `getSupportedVersions()` to `getSupportedMajorVersions()` for clarity.
+- **Logging guidelines** - Added logging section to CLAUDE.md: use `logDebug()` from `core/error-handler.ts` instead of `console.warn`/`console.log` to avoid polluting stdout/stderr and breaking JSON output modes.
+- **FEATURE.md audit** - Fixed incomplete engine lists (added MariaDB, ClickHouse), clarified file counts, fixed incorrect `paths.binaries` reference, added ClickHouse to reference implementations table.
+- **FerretDB planning** - Expanded FERRETDB.md with Windows support decision, detailed platform support table, hostdb build guide, and stretch goals section.
+
+## [0.19.2] - 2026-01-18
+
+### Added
+- **MIGRATION.md** - Historical guide for migrating engines from system binaries to hostdb, extracted from CLAUDE.md for reference.
+
+### Changed
+- **Docker E2E single-engine testing** - Run Docker tests for a single engine with `pnpm test:docker -- {engine}` for faster debugging cycles.
+- **CLAUDE.md refactored** - Reduced from 1043 to 271 lines (74% reduction). Added Related Documentation table, Supported Versions table with query languages, Container Config type, critical patterns (KNOWN_BINARY_TOOLS, version-maps sync), engine aliases, test port allocation, and platform philosophy. Moved migration guide to MIGRATION.md.
+- **Platform philosophy documented** - Engines no longer require universal OS/architecture support. Future: hostdb and SpinDB will merge to dynamically show available engines per platform.
+
+## [0.19.1] - 2026-01-18
+
+### Changed
+- **Faster menu startup** - Parallelized async operations in the interactive menu for faster startup:
+  - Container list and engine checks now run concurrently
+  - All 9 engine detection checks (PostgreSQL, MySQL, MariaDB, etc.) now run in parallel
+  - Container status checks (`isRunning`) now run in parallel instead of sequentially
+
+## [0.19.0] - 2026-01-18
+
+### Added
+- **DuckDB engine support** - Full container lifecycle for DuckDB, the embedded OLAP database
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - File-based database (like SQLite) - no server process, no port management
+  - Version 1 supported (1.4.3 from hostdb)
+  - Uses `duckdb://` connection scheme
+  - Backup formats: `.sql` (SQL dump), `.duckdb` (binary copy)
+  - Full integration with SpinDB registry for tracking database files
+  - MIT licensed
+
+### Fixed
+- **Binary extraction for flat archives** - DuckDB hostdb archive has flat structure (binary at root, no `bin/` subdirectory). Updated binary managers for both DuckDB and SQLite to detect flat archives and create the `bin/` subdirectory during extraction for consistent structure across all engines.
+- **Container manager registry handling** - Added DuckDB registry support to container-manager.ts for `getConfig`, `exists`, `list`, `rename`, and `delete` operations. File-based databases (SQLite, DuckDB) use registries instead of container directories.
+- **MySQL CI cache version mismatch** - CI was caching MySQL version 9 but engines.json default is 8.0.40, causing Docker tests to re-download MySQL every run. Fixed by aligning CI cache key to `mysql-8.0`.
+- **ClickHouse binary not found after download** - `KNOWN_BINARY_TOOLS` in dependency-manager.ts was missing 'clickhouse' and several other tools. This caused `findBinary()` to skip the config lookup and fall back to PATH search only. Fixed by adding all missing tools: clickhouse, postgres, pg_ctl, initdb, mariadb tools, and sqlite tools.
+- **DuckDB "not running" error** - The `spindb run` command only checked for SQLite as a file-based database, causing DuckDB containers to fail with "not running" error. Fixed by adding DuckDB to the file-based engine check.
+
+### Changed
+- **Test reliability for file-based databases** - SQLite and DuckDB integration tests now verify they're using downloaded binaries (`source: 'bundled'`), not system binaries (`source: 'system'`). Tests fail fast with clear instructions if system binaries are configured, ensuring extraction bugs are caught.
+- **Docker E2E tests** - Added ClickHouse and DuckDB to the Docker test suite (`pnpm test:docker`). Updated FEATURE.md with clearer guidance on adding new engines to Docker tests, including file-based engine handling.
+
+## [0.18.1] - 2026-01-18
+
+### Fixed
+- **ClickHouse engine** - Fixed unstable tests
+  - Added timeout to connection attempts
+  - Added retry logic for connection attempts
+
+
+## [0.18.0] - 2026-01-17
+
+### Added
+- **ClickHouse engine support** - Full container lifecycle for ClickHouse, the column-oriented OLAP database
+  - Downloadable binaries for macOS and Linux (Intel/ARM) from hostdb
+  - Note: Windows not supported (hostdb doesn't provide Windows binaries)
+  - Version 25.12 supported (YY.MM format versioning)
+  - Uses unified `clickhouse` binary with subcommands (server, client)
+  - Default port 9000 (native TCP), HTTP port 8123
+  - Uses SQL query language (ClickHouse SQL dialect)
+  - XML configuration files (config.xml, users.xml)
+  - Backup format: `.sql` (DDL + INSERT statements)
+  - Full integration tests across macOS and Linux CI
+  - Apache-2.0 licensed
+
+## [0.17.3] - 2026-01-16
+
+### Fixed
+- **`pnpx spindb` now works correctly** - Fixed "tsx loader not found" error when running via pnpx
+  - Root cause: pnpm's content-addressable store places dependencies in different paths than npm/yarn
+  - Changed from hardcoded `node_modules/tsx/` path lookup to Node's module resolution via `createRequire`
+  - Now works with npm, pnpm, yarn, and any node_modules structure
+
+## [0.17.2] - 2026-01-14
+
+### Fixed
+- **Windows Redis and Valkey CI tests** - Fixed servers failing to start on Windows with "Connection refused" errors
+  - Root cause: MSYS2/Cygwin-built binaries expect paths in `/cygdrive/c/...` format, not `C:\...`
+  - Added `toCygwinPath()` helper to convert Windows paths for Redis and Valkey config files
+  - Added Promise-based spawn with proper error handling (following MySQL's working pattern)
+  - Added diagnostic output capturing stderr/stdout and log file content on failure
+
+### Changed
+- **Valkey port conflict test** - Aligned with Redis test behavior (verifies container creation without attempting conflicting start)
+- **CI workflow** - Added Valkey to commented-out Linux ARM64 test section for future enablement
+- **FEATURE.md** - Added documentation notes:
+  - Updating ARM64 tests when adding new engines
+  - Adding engine keyword to package.json for npm discoverability
+
+## [0.17.1] - 2026-01-14
+
+### Changed
+- **CI workflow improvements**
+  - Add `hostdb-sync` to ci-status job dependencies array
+  - Add `hostdb-sync` result check to final status validation
+  - Update feature branch trigger to valkey branch
+  - Update TODO comment formatting for dev branch push
+
+### Fixed
+- **Documentation updates**
+  - Add file-based engine edge cases table to FEATURE.md (start/stop/port/status behavior differences)
+  - Various code quality improvements from CodeRabbit review suggestions
+
+## [0.17.0] - 2026-01-14
+
+### Added
+- **Valkey engine support** - Full container lifecycle for Valkey, the Redis fork with BSD-3 licensing
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - Multi-version support: Run Valkey 8 and 9 simultaneously
+  - Supported versions: 8, 9 (synced with hostdb releases.json)
+  - Tools bundled: valkey-server, valkey-cli
+  - Default port 6379 (same as Redis, auto-increments if occupied)
+  - Uses `redis://` connection scheme for client compatibility
+  - Backup formats: `.valkey` (text commands) and `.rdb` (RDB snapshot)
+  - Full integration tests across macOS, Linux, and Windows CI
+  - Support for `iredis` enhanced CLI (Redis-protocol compatible)
+- **MongoDB binary downloads from hostdb** - MongoDB now uses pre-built binaries from [hostdb](https://github.com/robertjbass/hostdb) instead of system package managers
+  - Downloadable binaries for all platforms (macOS, Linux, Windows)
+  - Multi-version support: Run MongoDB 7.0 and 8.0 simultaneously
+  - No more dependency on Homebrew, apt, or Chocolatey for MongoDB
+  - Supported versions: 7.0, 8.0, 8.2 (synced with hostdb releases.json)
+  - All tools bundled: mongod, mongosh, mongodump, mongorestore
+- **Redis binary downloads from hostdb** - Redis now uses pre-built binaries from [hostdb](https://github.com/robertjbass/hostdb) instead of system package managers
+  - Downloadable binaries for all platforms (macOS, Linux, Windows)
+  - Multi-version support: Run Redis 7 and 8 simultaneously
+  - No more dependency on Homebrew, apt, or package managers for Redis
+  - Supported versions: 7, 8 (synced with hostdb releases.json)
+  - Tools bundled: redis-server, redis-cli
+- **SQLite binary downloads from hostdb** - SQLite now uses pre-built binaries from [hostdb](https://github.com/robertjbass/hostdb) instead of system binaries
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - No more dependency on system-installed sqlite3
+  - Supported version: 3 (synced with hostdb releases.json)
+  - Tools bundled: sqlite3, sqldiff, sqlite3_analyzer, sqlite3_rsync
+- **MongoDB, Redis, and SQLite in Manage Engines menu** - Can now download, list, and delete engine versions for all databases
+
+### Changed
+- **MongoDB, Redis, and SQLite now use downloaded binaries** - No longer requires system-installed binaries
+  - Legacy containers created with system binaries are treated as orphaned and will prompt to download matching version
+- **CI workflow** - All engine tests now use downloaded binaries from hostdb on all platforms
+
+### Removed
+- **Legacy binary detection code** - Old system binary detection code for MongoDB and Redis (available in git history if needed)
+
+## [0.16.0] - 2026-01-09
+
+### Added
+- **MySQL binary downloads from hostdb** - MySQL now uses pre-built binaries from [hostdb](https://github.com/robertjbass/hostdb) instead of system package managers
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - Multi-version support: Run MySQL 8.0 on port 3306 and MySQL 9 on port 3307 simultaneously
+  - No more dependency on Homebrew, apt, or Chocolatey for MySQL
+  - Supported versions: 8.0, 8.4, 9 (synced with hostdb releases.json)
+  - Client tools (mysql, mysqldump, mysqladmin) bundled with binaries
+- **MySQL in Manage Engines menu** - Can now download, list, and delete MySQL engine versions like PostgreSQL and MariaDB
+- **`getMysqlClientPath()` method in BaseEngine** - Engine-specific client path method for bundled MySQL binaries
+
+### Changed
+- **MySQL now uses downloaded binaries** - No longer requires system-installed MySQL
+  - Removed Linux workaround that used MariaDB as MySQL replacement
+  - All platforms now use genuine MySQL binaries from hostdb
+  - Legacy containers created with system MySQL are treated as orphaned and will prompt to download matching version
+- **MySQL default version** - Changed from 9.0 to 9 (matching hostdb release naming)
+- **MySQL supported versions** - Updated to 8.0, 8.4, 9 (matching what's available in hostdb)
+- **CI workflow** - MySQL tests now run on all platforms (Linux added) using downloaded binaries
+
+### Removed
+- **MariaDB as MySQL fallback on Linux** - No longer needed since hostdb provides MySQL binaries for Linux
+- **System package manager dependency for MySQL** - No more brew install mysql or apt install mysql-server required
+
+## [0.15.2] - 2026-01-09
+
+### Fixed
+- **MariaDB Linux/Windows CI failures** - Fixed MariaDB engine failing on Linux and Windows in GitHub Actions
+  - Added `--no-defaults` to MariaDB server startup to prevent reading config files with MySQL X Protocol options (`mysqlx-bind-address`) that MariaDB doesn't support
+  - Removed unsupported options (`--auth-root-authentication-method`, `--basedir`) from Windows `mariadb-install-db.exe` initialization
+
+### Changed
+- **TODO.md updated** - Added parallel CI matrix item for all 5 platform/arch combinations and fixed missing `linux-arm64` in Homebrew binary platforms
+
+## [0.15.1] - 2026-01-09
+
+### Fixed
+- **MariaDB/MySQL binary conflict resolved** - MariaDB now registers binaries under native names (`mariadb`, `mariadb-dump`, `mariadb-admin`) instead of mysql-named binaries
+  - Prevents MariaDB binaries from being used by MySQL engine (caused authentication plugin errors)
+  - Each engine now has completely separate binary registrations
+  - Test helpers updated to call correct client path method for each engine
+- **Emoji spacing in CLI** - Fixed narrow rendering of SQLite (🪶) and MariaDB (🦭) icons by adding trailing space
+
+### Changed
+- **MariaDB versions synced with hostdb** - Now supports all versions available in hostdb releases.json:
+  - 10.11 (LTS), 11.4 (LTS), 11.8 (latest)
+- **PostgreSQL 14 removed** - Version 14 is no longer available in hostdb releases, removed from supported versions
+  - Supported versions: 15, 16, 17, 18
+- **MariaDB now appears in Manage Engines menu** - Can download, list, and delete MariaDB engine versions like PostgreSQL
+
+### Added
+- **`getMariadbClientPath()` method in BaseEngine** - Engine-specific client path method for MariaDB
+- **Documentation for hostdb engine migration** - CLAUDE.md now includes comprehensive guide for migrating system-installed engines to hostdb downloadable binaries
+
+## [0.15.0] - 2026-01-08
+
+### Added
+- **MariaDB engine support** - Full container lifecycle for MariaDB using pre-compiled binaries from [hostdb](https://github.com/robertjbass/hostdb)
+  - Downloadable binaries for all platforms (macOS Intel/ARM, Linux x64/ARM, Windows)
+  - Create, start, stop, delete containers
+  - Backup with mariadb-dump in SQL (`.sql`) or compressed (`.sql.gz`) format
+  - Restore from SQL or compressed backups
+  - Clone containers
+  - Run SQL files or inline SQL via `spindb run`
+  - Client tools (mariadb, mariadb-dump, mariadb-admin) bundled with binaries
+  - Version 11.8 supported (more versions coming as hostdb expands)
+  - Default port 3307 to avoid conflict with MySQL
+  - Full integration tests across macOS, Linux, and Windows CI
+- New alias `maria` for MariaDB engine (e.g., `spindb create mydb -e maria`)
+
+### Changed
+- Updated documentation to reflect MariaDB as a first-class engine with downloadable binaries
+- Roadmap updated: MariaDB moved from "planned" to "shipped"
+
+## [0.14.0] - 2026-01-08
+
+### Changed
+- **PostgreSQL binary source migration** - Replaced zonky.io with [hostdb](https://github.com/robertjbass/hostdb) for macOS/Linux binaries
+  - Downloads from GitHub Releases instead of Maven Central
+  - Same PostgreSQL versions supported (14, 15, 16, 17, 18)
+  - Windows continues to use EnterpriseDB (EDB) binaries
+  - macOS binaries now include client tools (psql, pg_dump, pg_restore)
+- **Engine deletion now stops running containers first** - Before deleting a PostgreSQL engine, all running containers using that version are gracefully stopped
+  - Shows warning about which containers will be stopped
+  - Falls back to direct process kill (SIGTERM/SIGKILL) if pg_ctl fails
+  - Prompts for confirmation if any containers fail to stop
+
+### Added
+- **Orphaned container support** - PostgreSQL containers can now exist without their engine binary installed
+  - Deleting an engine no longer requires deleting containers first
+  - Container data is preserved in `~/.spindb/containers/`
+  - Starting an orphaned container prompts to download the missing engine
+  - Stopping an orphaned container uses direct process kill instead of pg_ctl
+- **`killProcess()` method in ProcessManager** - Direct process termination via SIGTERM/SIGKILL for cases where pg_ctl is unavailable
+  - Sends SIGTERM first for graceful shutdown
+  - Waits up to 10 seconds, then sends SIGKILL if needed
+  - Used as fallback when engine binary is missing
+
+### Fixed
+- **Binary extraction for nested tar.gz structures** - Some hostdb releases package binaries in a nested `postgresql/` directory
+  - Extraction now detects and handles both flat (`bin/`, `lib/`, `share/` at root) and nested (`postgresql/bin/`, etc.) structures
+  - Fixes "PostgreSQL binary not found" errors when downloading certain versions
+
+### Documentation
+- Updated CLAUDE.md to reflect hostdb migration and orphaned container support
+- Updated code comments in `version-maps.ts`, `binary-manager.ts`, and `binary-urls.ts` to reference hostdb instead of zonky.io
+
+## [0.13.4] - 2026-01-02
+
+### Added
+- **Version-specific binary validation for system engines** - MySQL, MongoDB, and Redis now validate that the requested version is actually installed
+  - Container creation fails with helpful error if requested version is not available
+  - Error message lists available versions with install commands (e.g., `brew install redis@7`)
+  - Stores binary path in container config to ensure version consistency across restarts
+
+### Changed
+- **Binary path stored in container config** - System-installed engines (MySQL, MongoDB, Redis) now store the exact binary path used during creation
+  - Containers use the stored binary path when starting, preventing silent fallback to different versions
+  - Legacy containers without `binaryPath` fall back to version detection with clear error messages
+- **Version-specific Homebrew path detection** - Added comprehensive path detection for versioned Homebrew formulas:
+  - MySQL: `mysql@5.7`, `mysql@8.0`, `mysql@8.4`, `mysql@9.0`
+  - MongoDB: `mongodb-community@6.0`, `mongodb-community@7.0`, `mongodb-community@8.0`
+  - Redis: `redis@6.2`, `redis@7.0`, `redis@7.2`, `redis@8.0`, `redis@8.2`
+
+### Fixed
+- **Silent version fallback bug** - Previously, containers could silently use a different version than requested if the exact version wasn't installed. Now throws a clear error with available versions.
+- **Homebrew formula suggestions in error messages** - Install commands now suggest correct versioned formulas:
+  - Redis: `redis@7.2`, `redis@8.2` (was incorrectly suggesting `redis@7`, `redis@8`)
+  - MySQL: `mysql@8.0` (was incorrectly suggesting `mysql@8.0.0`)
+  - MongoDB: `mongodb-community@7.0` (was incorrectly suggesting `mongodb-community@7.0.0`)
+- **Integration tests use dynamic versions** - Tests now detect installed engine versions instead of hardcoding, preventing failures when specific versions aren't installed
+
+## [0.13.3] - 2026-01-02
+
+### Added
+- **`backups` command** - List backup files in the current directory or a specified directory
+  - Detects backup format from file extension (`.sql`, `.dump`, `.sqlite`, `.archive`, `.rdb`, `.redis`, `.sql.gz`)
+  - Shows filename, size, modified time, format, and engine icon
+  - `--all` flag to include backups from `~/.spindb/backups`
+  - `--limit` to control number of results (default: 20)
+  - `--json` for machine-readable output
+- **Redis text backup format (`.redis`)** - New human-readable backup format for Redis
+  - Exports all keys as Redis commands that can be replayed
+  - Supports strings, hashes, lists, sets, and sorted sets
+  - Preserves TTLs on keys
+  - Can be edited manually and restored with `spindb restore`
+  - Restore pipes commands to running Redis instance (no restart required)
+  - Interactive prompt for merge vs replace behavior (FLUSHDB)
+  - Content-based detection: Files with Redis commands are recognized regardless of extension (e.g., `users.txt`, `data`)
+- **Backup/restore in container submenu** - Access backup and restore directly from a container's menu
+- **Restore from connection string in submenu** - Pull data from remote PostgreSQL, MySQL, or MongoDB databases
+- **Backup directory selection** - Choose output directory (current directory or custom path) in interactive backup flow
+- **Backup size estimate** - Shows estimated database size before backup starts
+- **Large backup confirmation** - Warns and prompts for confirmation when restoring files >1GB
+- **Auto-select single database** - Automatically selects the database when container has only one during restore
+- **Centralized backup format configuration** - New `config/backup-formats.ts` provides consistent format metadata across CLI
+
+### Changed
+- **Engine-specific backup format prompts** - Interactive backup now shows appropriate formats per engine:
+  - PostgreSQL: `.sql` / `.dump`
+  - MySQL: `.sql` / `.sql.gz`
+  - SQLite: `.sql` / `.sqlite`
+  - MongoDB: `.bson` / `.archive`
+  - Redis: `.redis` / `.rdb`
+- **Backup/restore icon swap** - Now uses `↓` for backup (download) and `↑` for restore (upload) for intuitive visual metaphor
+- **Refactored backup handlers** - Reduced code duplication with shared `performBackupFlow` function
+- **Redis restore UX** - Skips "Create new database" prompt since Redis uses numbered databases (0-15)
+- **Redis integration tests expanded** - New tests for text format backup/restore, merge vs replace modes, and content-based format detection
+
+### Fixed
+- **Redis text backup shell escaping** - Fixed `KEYS *` and other commands with special characters being incorrectly expanded by shell
+
+## [0.13.2] - 2026-01-01
+
+### Added
+- **Windows CI support for Redis** - Full Redis integration tests now run on Windows
+  - Direct download from GitHub releases (memurai-io/redis) instead of Chocolatey for reliability
+  - Comprehensive path detection across multiple installation locations
+  - Enhanced error handling with detailed diagnostics when Redis binaries aren't found
+
+### Changed
+- Redis Windows installation in CI now uses direct GitHub download approach for faster, more reliable builds
+
+## [0.13.0] - 2026-01-01
+
+### Added
+- **Redis support** - Full container lifecycle for Redis 6, 7, and 8
+  - Create, start, stop, delete containers
+  - Backup with BGSAVE/RDB and restore from RDB files
+  - Clone containers via backup/restore
+  - Run Redis commands via files or inline via `spindb run`
+  - System binary detection for `redis-server` and `redis-cli`
+  - Support for `--iredis` enhanced CLI flag
+  - Multi-version support via Homebrew versioned formulas (`redis@7`, `redis@6`)
+  - Full macOS and Linux CI integration tests (Windows to follow)
+- Redis and MongoDB added to `spindb engines` list output
+
+### Changed
+- **`run` command:** Added `-c, --command` flag for inline commands (preferred over `--sql` which is now deprecated but still works)
+- **`create` command:** Changed `--version` to `--db-version` to avoid conflict with global `-v, --version` flag
+
+## [0.12.4] - 2025-12-30
+
+### Added
+- **Redis engine specification** - Added REDIS-SPEC.md documenting the implementation plan for Redis support
+
+## [0.12.3] - 2025-12-30
+
+### Added
+- **CHEATSHEET.md** - Quick reference card with common commands, workflows, and scripting patterns (EXAMPLES.md content consolidated here)
+
+## [0.12.2] - 2025-12-30
+
+### Fixed
+- **Windows MongoDB test failures** - Test helpers now use platform-aware shell quoting (double quotes on Windows, single quotes on Unix) for `mongosh --eval` commands
+
+### Changed
+- **Simplified test scripts** - Removed redundant `--test-concurrency=1` flag from all test scripts; `--experimental-test-isolation=none` is sufficient to disable worker isolation
+- **CI: Added MongoDB binary verification on Windows** - Post-install step verifies `mongod`, `mongosh`, and `mongodump` are usable before running tests
+
+## [0.12.0] - 2025-12-30
+
+### Added
+- **MongoDB support** - Full container lifecycle for MongoDB 6.0, 7.0, and 8.0
+  - Create, start, stop, delete containers
+  - Backup with `mongodump` and restore with `mongorestore`
+  - Clone containers
+  - Run JavaScript files or inline scripts via `spindb run`
+  - System binary detection for `mongod`, `mongosh`, `mongodump`, `mongorestore`
+  - Full cross-platform support (macOS, Linux, Windows) with CI integration tests
+
+## [0.11.2] - 2025-12-29
+
+### Changed
+- CI: Parallelized test execution with caching for faster builds
+- CI: Updated to Node.js 22
+- CI: Added `--test-concurrency=1` flag to all test scripts to prevent macOS Node 22 serialization bug
+
+## [0.11.0] - 2025-12-29
+
+### Highlights
+
+**PostgreSQL 18 is now supported and is the new default version.** PostgreSQL 18 was released on September 25, 2025 and brings significant performance improvements including up to 3x faster I/O operations, virtual generated columns, and the new `uuidv7()` function.
+
+### Added
+- **PostgreSQL 18 support** - Added PostgreSQL 18.1.0 as a supported version (now the default for new containers)
+- **Pre-commit hook for new PostgreSQL versions** - Automatically alerts when new PostgreSQL major versions are available on zonky.io but not yet supported by SpinDB (`scripts/check-pg-versions.ts`)
+- **Unit tests for `getInstallCommand()`** - 3 new tests verifying cross-platform install command generation
+- **CLI E2E tests for backup/restore/clone** - 15 new tests covering:
+  - SQL backup creation and JSON output
+  - Restore to new database
+  - Restore with `--force` flag to replace existing database
+  - Data verification after restore
+  - Clone stopped container
+  - Clone metadata (`clonedFrom` field)
+
+### Changed
+- Exported `getInstallCommand()` from `engines/postgresql/version-validator.ts` for testability
+- Added clarifying comment for retry loop behavior in restore flow
+
+### Fixed
+- **Interactive restore "press Enter to go back" now works correctly** - Empty input at connection string and file path prompts now returns to container selection instead of exiting the wizard
+- **Fixed inaccurate navigation comments** - Updated comments to accurately describe `continue` behavior (returns to container selection, not source selection)
+- **Consistent use of `pressEnterToContinue()` helper** - Replaced 6 manual `inquirer.prompt` patterns with the shared helper for consistent UX
+
+## [0.10.6] - 2025-12-29
+
+### Changed
+- **Refactored `handleRestore` from recursive to loop-driven** - Back navigation now uses `while(true)` with `continue` instead of recursive calls, eliminating stack growth
+- **`dumpFromConnectionString` no longer logs warnings directly** - Warnings are now returned in the result object; CLI callers handle display (better separation of concerns)
+- **Cross-platform install command generation** - `getInstallCommand` now uses `detectPackageManager()` to generate appropriate commands for apt, yum, dnf, pacman, and brew
+- **Renamed `detectInstalledHomebrewPostgres` to `detectInstalledPostgres`** - Name now reflects cross-platform behavior (macOS Homebrew + Linux APT)
+- **Consolidated `MISSING_DEPENDENCY` error code** - Removed redundant alias, now only uses `DEPENDENCY_MISSING`
+
+### Fixed
+- **Container creation duplicate-name loop** - Users can now cancel by pressing Enter (was previously stuck requiring Ctrl+C)
+- **Added `warnings` field to `DumpResult` type** - Proper type safety for warning propagation
+
+## [0.10.5] - 2025-12-29
+
+### Added
+- **Menu navigation improvements** - All interactive menus now have "Back" and "Back to main menu" options
+  - Container creation wizard: step-by-step flow with back navigation at each step (engine, version, name, port, database)
+  - Backup/restore flows: back options at container selection, source selection, and format prompts
+  - Consistent navigation using `←` for back and `⌂` for main menu
+- **Restore mode selection** - Interactive restore now prompts for restore mode
+  - "Create new database" - Restore into a new database without affecting existing data
+  - "Replace existing database" - Overwrite an existing database (with confirmation)
+  - Shows existing databases in container before prompting for target name
+
+### Changed
+- Standardized menu icon from `🏠` to `⌂` for consistent terminal width
+
+### Fixed
+- TypeScript function overloads added to prompt functions for proper type inference when using `allowBack` option
+
+## [0.10.4] - 2025-12-28
+
+### Changed
+- Updated tagline from "Local databases without the Docker baggage" to "The first npm CLI for running local databases without Docker"
+- Added XAMPP to feature comparison table in README
+- Added new "Platform Support vs Alternatives" comparison table showing architecture-specific support across macOS, Linux, and Windows
+
+## [0.10.3] - 2025-12-28
+
+### Added
+- **Automatic PostgreSQL client tools installation** - SpinDB now auto-installs psql, pg_dump, pg_restore when missing from zonky.io binaries
+  - macOS: Installs via Homebrew (`postgresql@17`) and registers tool paths
+  - Linux: Downloads from PostgreSQL apt repository and extracts to binary directory
+  - CI environments: Auto-installs without prompting (detects `CI`, `GITHUB_ACTIONS` env vars)
+- **`engines download` command expanded** - Now supports MySQL and SQLite installation via system package managers
+  - `spindb engines download mysql` - Installs via Homebrew (macOS), apt/mariadb (Linux), or Chocolatey (Windows)
+  - `spindb engines download sqlite` - Installs via system package manager
+  - PostgreSQL continues to download binaries from zonky.io (macOS/Linux) or EDB (Windows)
+
+### Changed
+- CI workflow now uses SpinDB for all engine installations instead of direct package manager calls
+- Dependency manager allows passwordless sudo in CI environments (GitHub Actions, GitLab CI, etc.)
+
+## [0.10.2] - 2025-12-27
+
+### Added
+- **Unified CI workflow** - Consolidated GitHub Actions workflow (`ci.yml`) replacing separate platform workflows
+  - Runs unit tests, PostgreSQL, MySQL, SQLite integration tests across Ubuntu, macOS, and Windows
+  - Includes lint and type checking job
+  - CLI E2E test job for full command workflow validation
+  - Concurrency controls to cancel in-progress runs on new pushes
+- **CLI end-to-end tests** (`tests/integration/cli-e2e.test.ts`) - Tests actual CLI commands rather than core modules
+  - Version, help, doctor, and engines command tests
+  - Full PostgreSQL workflow: create → list → start → info → url → run SQL → stop → delete
+  - Full SQLite workflow: create → list → info → run SQL → delete
+  - Error handling tests for invalid inputs
+- `test:cli` npm script for running CLI E2E tests independently
+
+### Changed
+- Test container name generation uses underscores instead of hyphens for PostgreSQL compatibility (database names can't contain hyphens)
+- Moved `EVALUATION.md` to `evaluations/` directory
+
+### Removed
+- Separate Windows test workflow (`test-windows.yml`) - functionality merged into unified CI workflow
+
+## [0.10.1] - 2025-12-27
+
+### Added
+- **--json flag for all data-outputting commands** - Enable scriptable, machine-readable output across the CLI
+  - `spindb backup --json` - Returns backup path, size, format, database, and container
+  - `spindb restore --json` - Returns success status, database, format, source type, and connection string
+  - `spindb create --json` - Returns container name, engine, version, port, database, and connection string
+  - `spindb start --json` - Returns container name, port, connection string, and port change status
+  - `spindb stop --json` - Returns stopped container names and count
+  - `spindb delete --json` - Returns deleted container name and engine
+  - `spindb clone --json` - Returns source, target, new port, and connection string
+  - `spindb edit --json` - Returns container name and changes made (rename, port, relocate, config)
+- **--force flag for restore command** - Overwrite existing databases without confirmation
+  - `spindb restore <container> <backup> -d <database> --force` - Drops and recreates database
+  - Interactive confirmation prompt when database exists (unless --force or --json mode)
+  - Automatic cleanup of old database before restoration
+
+### Changed
+- **Restore command now checks for existing databases** - Prevents accidental data loss
+  - Prompts user for confirmation before overwriting existing database
+  - Drops existing database and removes from tracking before restoration
+  - In --json mode, exits with error if database exists without --force flag
+
+## [0.10.0] - 2025-12-26
+
+### Added
+- **Windows support** - Full cross-platform support for Windows x64
+  - PostgreSQL binaries from EnterpriseDB (EDB) official distribution
+  - Platform abstraction via `Win32PlatformService` class
+  - Process management using `taskkill` instead of Unix signals
+  - MySQL skips Unix socket on Windows (TCP only)
+  - SQLite cross-platform binary detection
+  - Windows package managers: Chocolatey, winget, Scoop
+  - GitHub Actions Windows CI workflow
+- `unzipper` dependency for cross-platform ZIP extraction
+- `engines/postgresql/edb-binary-urls.ts` - EDB binary URL builder for Windows
+
+### Changed
+- Binary manager now uses `unzipper` npm package instead of shell commands for ZIP extraction
+- Platform service extended with `getNullDevice()`, `getExecutableExtension()`, `terminateProcess()`, `isProcessRunning()` methods
+- MySQL process termination now uses platform service abstraction
+- Process manager now uses `platformService.getNullDevice()` instead of hardcoded `/dev/null`
+
+## [0.9.3] - 2025-12-07
+
+### Added
+- **SQLite registry migration** - Registry moved from `~/.spindb/sqlite-registry.json` into `~/.spindb/config.json`
+  - Centralized storage under `registry.sqlite` with `version`, `entries`, and `ignoreFolders` fields
+  - Backwards compatible: registry facade API unchanged for existing code
+- **CWD scanning for SQLite files** - Auto-detect unregistered `.sqlite`, `.sqlite3`, `.db` files
+  - `spindb list` now scans current directory and prompts to register discovered files
+  - `--no-scan` flag to skip CWD scanning
+  - Option to ignore folder permanently ("don't ask again for this folder")
+- **`attach` command** - Register existing SQLite database files with SpinDB
+  - `spindb attach <path> [--name <name>] [--json]`
+  - Auto-derives container name from filename if not specified
+- **`detach` command** - Unregister SQLite database (keeps file on disk)
+  - `spindb detach <name> [--force] [--json]`
+  - Confirmation prompt unless `--force` flag used
+- **`sqlite` subcommand group** - SQLite-specific operations
+  - `spindb sqlite scan [--path <dir>]` - Scan folder for unregistered files
+  - `spindb sqlite ignore [folder]` - Add folder to ignore list (defaults to CWD)
+  - `spindb sqlite unignore [folder]` - Remove folder from ignore list (defaults to CWD)
+  - `spindb sqlite ignored` - List all ignored folders
+  - `spindb sqlite attach` - Alias for top-level attach
+  - `spindb sqlite detach` - Alias for top-level detach
+- **Detach option in interactive menu** - SQLite containers now show "Detach from SpinDB" in submenu
+- Unit tests for `ignoreFolders` functionality (8 new tests)
+- Unit tests for `deriveContainerName` scanner function (8 new tests)
+
+### Changed
+- Doctor command now shows ignored folders count in SQLite registry details
+- SQLite registry now uses O(1) lookup for ignored folders via `Record<string, true>`
+
+### Removed
+- `~/.spindb/sqlite-registry.json` file (migrated to config.json)
+- `getSqliteRegistryPath()` function from paths.ts (no longer needed)
+
+## [0.9.2] - 2025-12-07
+
+### Added
+- STYLEGUIDE.md documenting coding conventions for OSS contributors
+- ESLint rule `@typescript-eslint/consistent-type-imports` to enforce type import conventions
+
+### Changed
+- Renamed UI theme helper functions from generic names to `ui*` prefix for clarity:
+  - `success` → `uiSuccess`
+  - `error` → `uiError`
+  - `warning` → `uiWarning`
+  - `info` → `uiInfo`
+- Standardized error variable naming: all catch blocks now use `error` instead of `err`
+
+## [0.9.1] - 2025-12-06
+
+### Added
+- `--start` flag for `create` command to start container immediately after creation (skip prompt)
+- `--no-start` flag for `create` command to skip starting container after creation
+- `--connect` flag for `create` command to open shell connection after creation (implies `--start`)
+- SQLite now appears in `engines` list (CLI and interactive menu)
+- `handleSqliteInfo()` function in interactive menu to display SQLite installation details
+- Database name validation functions (`isValidDatabaseName`, `assertValidDatabaseName`) for SQL injection prevention
+- Unit tests for database name validation (15 new tests)
+- Throw assertion to dependency-manager test to verify error is actually thrown
+- Mock restoration to port-manager test to prevent test pollution
+
+### Fixed
+- Column alignment in engines list now properly handles emoji width with `padWithEmoji()` helper
+- SQL injection vulnerability via unsanitized database names in PostgreSQL and MySQL engines
+- Resource leak in port manager where socket wasn't closed on non-EADDRINUSE errors
+- MySQL start promise that could hang indefinitely when `mysqladmin` path is null
+- MySQL backup pipeline double-rejection causing unhandled rejection errors
+- Restore command now uses TransactionManager for proper rollback on failure
+- Clone and rename operations now use TransactionManager for atomicity
+- Init cleanup now properly removes data directory on initialization failure
+- Restore success check now properly requires exit code 0 (previously could hide failures with no stderr)
+- Clone command now validates target name doesn't already exist before starting clone operation
+- Clone operation in menu now properly handles errors with spinner feedback
+- SQLite file extension validation now case-insensitive (accepts .SQLITE, .DB, etc.)
+- Edit command `--set-config` now properly fails if engine doesn't support config editing (previously silent no-op)
+- SQLite integration tests now use `execFile` instead of shell interpolation to prevent command injection
+- BinarySource type check in config-manager tests now validates actual type union (`bundled | system | custom`)
+
+### Changed
+- Engines list display now uses consistent `padWithEmoji()` function across CLI and menu
+- Emoji width detection upgraded from limited Unicode range to `\p{Emoji}` property escape for full coverage
+- MySQL compressed backup now properly waits for both pipeline AND process exit before resolving
+- Database name validation now rejects hyphens (require quoted identifiers in SQL, causing user confusion)
+
+## [0.9.0] - 2025-12-06
+
+### Added
+- **SQLite engine support** - File-based database engine, no server process required
+  - Databases stored in project directories (CWD by default), not ~/.spindb/
+  - Registry system at `~/.spindb/sqlite-registry.json` to track database file locations
+  - Full lifecycle support: create, delete, connect, backup, restore, rename
+  - Create with `--path` option for custom file location
+  - Enhanced CLI support with `litecli`
+  - Relocate databases with `spindb edit mydb --relocate ~/new/path`
+  - Status shows "available"/"missing" instead of "running"/"stopped"
+- **`doctor` command** - System health checks and diagnostics
+  - Checks configuration validity and binary cache staleness
+  - Reports container status across all engines
+  - Detects orphaned SQLite registry entries (files deleted outside SpinDB)
+  - Verifies database tool availability
+  - Interactive action menu to fix issues
+  - JSON output with `--json` flag
+  - Available in both CLI (`spindb doctor`) and interactive menu
+- `logs` command to view container logs (`--follow`, `-n`, `--editor` options)
+- `--json` flag for `config show` and `url` commands
+- `status` alias for `info` command
+- `shell` alias for `connect` command
+- Port availability validation in `edit` command
+- `--max-connections` flag for `create` command to customize connection limits
+- `--set-config` flag for `edit` command to modify PostgreSQL config values
+- Interactive config editing in `edit` menu for PostgreSQL containers
+- Higher default `max_connections` (200) for new PostgreSQL and MySQL containers to support parallel builds (Next.js, etc.)
+- `--relocate` flag for `edit` command to move SQLite database files
+  - Supports tilde expansion (`~/path`), relative paths, and directories
+  - Auto-creates destination directories if needed
+  - Updates both container config and SQLite registry
+  - `--overwrite` flag to replace existing destination file
+  - Cross-filesystem moves supported (copy+delete fallback for EXDEV)
+
+### Changed
+- Refactored interactive menu from single 2749-line file into modular handler structure
+  - New `cli/commands/menu/` directory with feature-specific handler modules
+  - Extracted: `container-handlers.ts`, `backup-handlers.ts`, `shell-handlers.ts`, `sql-handlers.ts`, `engine-handlers.ts`, `update-handlers.ts`
+  - Shared utilities in `shared.ts` (`MenuChoice` type, `pressEnterToContinue`)
+- Converted dynamic imports to static top-level imports across codebase for better maintainability
+- SQLite containers now properly rename via registry instead of container directories
+- Container list display improved for narrow terminals with emoji width handling
+
+### Fixed
+- SQLite container deletion now properly cleans up container directories in `~/.spindb/containers/sqlite/`
+- SQLite relocation now updates both container config and registry (prevents "missing" status)
+- Tilde expansion in paths (`~/path` now correctly expands to home directory)
+- SQLite creation no longer prompts for port
+- SQLite shell options now show sqlite3/litecli instead of psql/pgcli
+- Container rename now works correctly for SQLite containers
+
+## [0.7.1] - 2025-11-30
+
+### Changed
+- Improved file path prompt UX by moving instructions above input field
+
+## [0.7.0] - 2025-11-29
+
+### Added
+- `run` command to execute SQL files against containers
+- Inline SQL support with `--sql` flag
+- Engine enum for improved type safety
+
+### Changed
+- Replaced EngineName type with Engine enum across codebase
+
+## [0.6.0] - 2025-11-29
+
+### Added
+- `self-update` command with automatic update notifications
+- Version management and update checking (`spindb version --check`)
+- Homebrew binary distribution plan (Bun compilation)
+
+## [0.5.5] - 2025-11-29
+
+### Added
+- `backup` command with multi-database support
+- Format options: SQL (plain text) and dump (compressed)
+- Database size column in container listings
+
+### Changed
+- PostgreSQL binary management to use full versions instead of major versions only
+- Config management to support MySQL tools and enhanced shells
+
+## [0.5.0] - 2025-11-27
+
+### Added
+- MySQL/MariaDB engine support
+- Enhanced shell options (pgcli, mycli, usql)
+- Comprehensive CLI commands for container management
+- Integration test suite for PostgreSQL and MySQL
+
+### Changed
+- Multi-engine architecture with abstract BaseEngine class
+
+## [0.4.0] - 2025-11-26
+
+### Added
+- Dependency management system with automatic installation (`spindb deps`)
+- Create-with-restore feature (`--from` flag)
+- Interactive restore workflow with auto-detection
+
+## [0.3.0] - 2025-11-26
+
+### Added
+- Clone container functionality
+- Edit command for renaming and port changes
+- Port conflict detection with auto-increment
+- GitHub Actions workflow for automated npm publishing
+
+### Changed
+- License updated to PolyForm Noncommercial 1.0.0
+
+## [0.2.0] - 2025-11-25
+
+### Added
+- Interactive menu with arrow-key navigation
+- Multiple PostgreSQL versions (14, 15, 16, 17)
+- Connection string output and clipboard support
+
+### Changed
+- Refactored project structure to remove TypeScript path aliases
+
+## [0.1.0] - 2025-11-25
+
+### Added
+- Initial release
+- PostgreSQL container management (create, start, stop, delete)
+- Binary download from zonky.io
+- Basic backup and restore

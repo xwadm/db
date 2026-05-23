@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SpinDB 引擎配置",
+  "type": "object",
+  "required": ["engines"],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "engines": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/engine"
+      }
+    }
+  },
+  "definitions": {
+    "engine": {
+      "type": "object",
+      "required": [
+        "displayName",
+        "icon",
+        "status",
+        "binarySource",
+        "defaultPort",
+        "runtime",
+        "queryLanguage",
+        "scriptFileLabel",
+        "connectionScheme",
+        "superuser",
+        "clientTools"
+      ],
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "description": "引擎的人类可读名称"
+        },
+        "icon": {
+          "type": "string",
+          "description": "引擎的表情符号图标"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["integrated", "pending", "planned"],
+          "description": "引擎的集成状态"
+        },
+        "binarySource": {
+          "type": "string",
+          "enum": ["hostdb", "system", "edb"],
+          "description": "引擎二进制文件的来源"
+        },
+        "defaultPort": {
+          "type": ["integer", "null"],
+          "description": "默认端口号（嵌入式数据库为 null）"
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["server", "embedded"],
+          "description": "引擎是以服务器模式运行还是嵌入式运行"
+        },
+        "queryLanguage": {
+          "type": "string",
+          "enum": ["sql", "javascript", "redis", "rest", "surrealql", "typeql"],
+          "description": "引擎使用的查询语言"
+        },
+        "scriptFileLabel": {
+          "type": ["string", "null"],
+          "description": "运行脚本文件的菜单标签（例如 '运行 SQL 文件'、'运行 TypeQL 文件'）。对于不支持脚本文件的 REST API 引擎，该值为 null。"
+        },
+        "connectionScheme": {
+          "type": "string",
+          "description": "连接字符串的 URI 方案"
+        },
+        "superuser": {
+          "type": ["string", "null"],
+          "description": "默认超级用户名（若无则为 null）"
+        },
+        "clientTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "引擎自带的客户端工具列表"
+        },
+        "licensing": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "单一许可证标识符"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "多个许可证选项"
+            }
+          ],
+          "description": "引擎的许可证类型（可为一个或多个）"
+        },
+        "notes": {
+          "type": "string",
+          "description": "关于引擎的附加说明"
+        },
+        "platforms": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "支持的平台-架构组合（例如 'darwin-arm64'）。如果省略，则表示支持所有平台。"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

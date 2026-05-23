@@ -1,0 +1,2274 @@
+#!/bin/bash
+# SpinDB Docker Linux E2E Test Script
+#
+# PURPOSE: Verify hostdb binaries work on minimal Linux systems.
+# Catches library dependency issues that wouldn't appear on well-provisioned systems.
+#
+# MODES:
+#   SMOKE TEST (default, SMOKE_TEST=true): ~5-7 minutes
+#     - Downloads binaries, starts containers, runs basic query, cleans up
+#     - Validates library dependencies work (the primary purpose of this test)
+#     - Skips: backup/restore, rename, clone, self-update (covered by other CI jobs)
+#
+#   FULL TEST (SMOKE_TEST=false): ~26 minutes
+#     - All phases: download, lifecycle, backup/restore, rename, clone, self-update
+#     - Useful for comprehensive local testing
+#
+# Usage:
+#   ./run-e2e.sh                         # Smoke test all engines
+#   ./run-e2e.sh postgresql              # Smoke test PostgreSQL only
+#   SMOKE_TEST=false ./run-e2e.sh        # Full test all engines
+#   SMOKE_TEST=false ./run-e2e.sh postgresql  # Full test PostgreSQL only
+
+set -e
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Parse command line arguments
+ENGINE_FILTER="${1:-}"
+VERBOSE="${VERBOSE:-false}"
+# Smoke test mode: only download + start + query + cleanup (skip backup/restore/rename/clone)
+# Set SMOKE_TEST=false for full test with all phases
+SMOKE_TEST="${SMOKE_TEST:-true}"
+
+# Space-separated list of engines to skip (e.g., SKIP_ENGINES="surrealdb questdb")
+# Useful for QEMU where large Rust/Java binaries may hang during verification
+SKIP_ENGINES="${SKIP_ENGINES:-}"
+
+# Engine groups for parallel CI execution
+# Usage: ./run-e2e.sh --group sql
+GROUP_SQL="postgresql mysql mariadb cockroachdb clickhouse questdb"
+GROUP_NOSQL="mongodb redis valkey surrealdb typedb"
+# "other" = REST API engines + file-based engines, grouped for CI load balancing
+GROUP_OTHER="qdrant meilisearch couchdb sqlite duckdb influxdb weaviate tigerbeetle libsql"
+
+# Valid engines and utility tests
+VALID_ENGINES="postgresql mysql mariadb sqlite mongodb ferretdb ferretdb-v1 redis valkey clickhouse duckdb qdrant meilisearch couchdb cockroachdb surrealdb questdb typedb influxdb weaviate tigerbeetle libsql"
+VALID_UTILITY_TESTS="self-update"
+VALID_GROUPS="sql nosql other"
+VALID_ALL="$VALID_ENGINES $VALID_UTILITY_TESTS"
+
+# Handle --group flag
+ENGINE_GROUP=""
+if [ "$ENGINE_FILTER" = "--group" ]; then
+  ENGINE_GROUP="${2:-}"
+  ENGINE_FILTER=""
+  if [ -z "$ENGINE_GROUP" ]; then
+    echo "Error: --group requires a group name"
+    echo "Valid groups: $VALID_GROUPS"
+    exit 1
+  fi
+  if ! echo "$VALID_GROUPS" | grep -qw "$ENGINE_GROUP"; then
+    echo "Error: Invalid group '$ENGINE_GROUP'"
+    echo "Valid groups: $VALID_GROUPS"
+    echo "  sql:   $GROUP_SQL"
+    echo "  nosql: $GROUP_NOSQL"
+    echo "  other: $GROUP_OTHER"
+    exit 1
+  fi
+fi
+
+# Validate filter (accepts engine names OR utility test names)
+if [ -n "$ENGINE_FILTER" ]; then
+  if ! echo "$VALID_ALL" | grep -qw "$ENGINE_FILTER"; then
+    echo "Error: Invalid test '$ENGINE_FILTER'"
+    echo "Valid engines: $VALID_ENGINES"
+    echo "Valid utility tests: $VALID_UTILITY_TESTS"
+    echo "Valid groups (--group): $VALID_GROUPS"
+    exit 1
+  fi
+  # FerretDB (v1 and v2) is skipped in Docker E2E due to timeout/signal issues
+  if [ "$ENGINE_FILTER" = "ferretdb" ] || [ "$ENGINE_FILTER" = "ferretdb-v1" ]; then
+    echo "FerretDB is skipped in Docker E2E tests due to timeout/signal handling issues."
+    echo "FerretDB tests run on GitHub Actions macOS/Linux/Windows runners via:"
+    echo "  pnpm test:engine ferretdb      # v2 tests"
+    echo "  pnpm test:engine ferretdb-v1   # v1 tests"
+    exit 0
+  fi
+  # Note: TigerBeetle requires io_uring syscalls. Docker's default seccomp profile
+  # blocks these, so run-docker-test.sh uses --security-opt seccomp=unconfined.
+fi
+
+# Timeouts
+STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-60}
+START_TIMEOUT=${START_TIMEOUT:-120}  # Max seconds for `spindb start` command
+
+# Directories
+BACKUP_DIR=$(mktemp -d)
+
+# Track current container for cleanup on interrupt
+CURRENT_CONTAINER=""
+
+# Track if we created a temp SPINDB_HOME (for cleanup)
+CREATED_TEMP_SPINDB_HOME=""
+
+# Cleanup function for graceful exit
+cleanup() {
+  local exit_code=$?
+  echo ""
+  echo "Cleaning up..."
+
+  # Stop and delete any running test container
+  if [ -n "$CURRENT_CONTAINER" ]; then
+    spindb stop "$CURRENT_CONTAINER" &>/dev/null || true
+    spindb delete "$CURRENT_CONTAINER" --yes &>/dev/null || true
+  fi
+
+  # Clean up backup directory
+  rm -rf "$BACKUP_DIR" 2>/dev/null || true
+
+  # Clean up temp SPINDB_HOME if we created one (non-CI mode)
+  if [ -n "$CREATED_TEMP_SPINDB_HOME" ]; then
+    rm -rf "$CREATED_TEMP_SPINDB_HOME" 2>/dev/null || true
+  fi
+
+  exit $exit_code
+}
+
+# Handle interrupts gracefully
+handle_interrupt() {
+  # Disable further signal handling to prevent recursion
+  trap - INT TERM
+  echo ""
+  echo "Interrupted by user"
+  # Kill any child processes - try pkill first, fall back to process group kill
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -P $$ 2>/dev/null || true
+  else
+    # Fall back to killing the process group (works on minimal systems without pkill)
+    # Get our process group ID and kill all processes in it except ourselves
+    local pgid
+    pgid=$(ps -o pgid= $$ 2>/dev/null | tr -d ' ')
+    if [ -n "$pgid" ] && [ "$pgid" != "$$" ]; then
+      kill -TERM -"$pgid" 2>/dev/null || true
+    fi
+  fi
+  exit 130
+}
+trap handle_interrupt INT TERM
+trap cleanup EXIT
+# TypeDB HTTP port is main port + this offset (default: 1729 + 6271 = 8000)
+TYPEDB_HTTP_PORT_OFFSET=6271
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIXTURES_DIR="$SCRIPT_DIR/../fixtures"
+
+# Expected counts and backup formats
+# Format names are engine-specific semantic names (no longer sql|dump for all)
+# Note: ferretdb is excluded - it's skipped in Docker E2E due to timeout/signal handling issues
+declare -A EXPECTED_COUNTS=(
+  [postgresql]=5 [mysql]=5 [mariadb]=5 [mongodb]=5
+  [redis]=6 [valkey]=6 [clickhouse]=5 [sqlite]=5 [duckdb]=5 [qdrant]=3 [meilisearch]=3 [couchdb]=5 [cockroachdb]=5 [surrealdb]=5 [questdb]=5 [typedb]=5 [influxdb]=5 [weaviate]=3 [tigerbeetle]=0 [libsql]=5
+)
+declare -A BACKUP_FORMATS=(
+  [postgresql]="sql|custom"
+  [mysql]="sql|compressed"
+  [mariadb]="sql|compressed"
+  [mongodb]="bson|archive"
+  [redis]="text|rdb"
+  [valkey]="text|rdb"
+  [clickhouse]="sql"
+  [sqlite]="sql|binary"
+  [duckdb]="sql|binary"
+  [qdrant]="snapshot"
+  [meilisearch]="snapshot"
+  [couchdb]="json"
+  [cockroachdb]="sql"
+  [surrealdb]="surql"
+  [questdb]="sql"
+  [typedb]="typeql"
+  [influxdb]="sql"
+  [weaviate]="snapshot"
+  [tigerbeetle]="binary"
+  [libsql]="binary|sql"
+)
+
+# Results tracking
+PASSED=0
+FAILED=0
+declare -a RESULTS_ENGINE RESULTS_VERSION RESULTS_STATUS RESULTS_ERROR RESULTS_DETAILS
+
+# ============================================================================
+# LOGGING UTILITIES
+# ============================================================================
+
+# Colors (detect if terminal supports colors)
+if [ -t 1 ] && command -v tput &>/dev/null; then
+  RED=$(tput setaf 1)
+  GREEN=$(tput setaf 2)
+  YELLOW=$(tput setaf 3)
+  BLUE=$(tput setaf 4)
+  MAGENTA=$(tput setaf 5)
+  CYAN=$(tput setaf 6)
+  DIM=$(tput dim)
+  BOLD=$(tput bold)
+  RESET=$(tput sgr0)
+else
+  RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" DIM="" BOLD="" RESET=""
+fi
+
+# Logging functions
+log_header() {
+  echo ""
+  echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  echo "${BOLD}${CYAN}  $1${RESET}"
+  echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+}
+
+log_section() {
+  echo ""
+  echo "${BOLD}▸ $1${RESET}"
+}
+
+log_step() {
+  printf "  ${DIM}%-50s${RESET}" "$1"
+}
+
+log_step_ok() {
+  echo " ${GREEN}✓${RESET}"
+}
+
+log_step_fail() {
+  echo " ${RED}✗${RESET}"
+}
+
+log_step_skip() {
+  echo " ${YELLOW}○${RESET}"
+}
+
+log_step_result() {
+  local status=$1
+  local detail=${2:-}
+  if [ "$status" = "ok" ]; then
+    if [ -n "$detail" ]; then
+      echo " ${GREEN}✓${RESET} ${DIM}($detail)${RESET}"
+    else
+      echo " ${GREEN}✓${RESET}"
+    fi
+  elif [ "$status" = "fail" ]; then
+    if [ -n "$detail" ]; then
+      echo " ${RED}✗ $detail${RESET}"
+    else
+      echo " ${RED}✗${RESET}"
+    fi
+  elif [ "$status" = "skip" ]; then
+    echo " ${YELLOW}○${RESET} ${DIM}skipped${RESET}"
+  fi
+}
+
+log_detail() {
+  echo "    ${DIM}$1${RESET}"
+}
+
+log_error() {
+  echo "  ${RED}ERROR: $1${RESET}"
+}
+
+log_warning() {
+  echo "  ${YELLOW}WARNING: $1${RESET}"
+}
+
+log_success() {
+  echo "  ${GREEN}$1${RESET}"
+}
+
+log_verbose() {
+  if [ "$VERBOSE" = "true" ]; then
+    echo "    ${DIM}$1${RESET}"
+  fi
+}
+
+# Engine result summary
+print_engine_result() {
+  local engine=$1
+  local version=$2
+  local status=$3
+  local error=${4:-}
+
+  echo ""
+  echo "${DIM}************************************************************${RESET}"
+  echo ""
+  if [ "$status" = "PASSED" ]; then
+    echo "  ${GREEN}${BOLD}✓ $engine v$version PASSED${RESET}"
+  else
+    echo "  ${RED}${BOLD}✗ $engine v$version FAILED${RESET}"
+    if [ -n "$error" ]; then
+      echo "  ${RED}Reason: $error${RESET}"
+    fi
+  fi
+  echo ""
+  echo "${DIM}************************************************************${RESET}"
+}
+
+# ============================================================================
+# RECORD RESULTS
+# ============================================================================
+
+record_result() {
+  local engine=$1 version=$2 status=$3 error=${4:-""} details=${5:-""}
+  RESULTS_ENGINE+=("$engine")
+  RESULTS_VERSION+=("$version")
+  RESULTS_STATUS+=("$status")
+  RESULTS_ERROR+=("$error")
+  RESULTS_DETAILS+=("$details")
+}
+
+# ============================================================================
+# DATA LIFECYCLE HELPERS
+# ============================================================================
+
+# Store last error for display
+LAST_ERROR=""
+
+# Run command and capture error on failure
+run_cmd() {
+  local output
+  if output=$("$@" 2>&1); then
+    return 0
+  else
+    LAST_ERROR="$output"
+    return 1
+  fi
+}
+
+insert_seed_data() {
+  local engine=$1 container_name=$2
+  local seed_file=""
+
+  case $engine in
+    postgresql)
+      spindb run "$container_name" -c "CREATE DATABASE testdb;" -d postgres &>/dev/null || true
+      seed_file="$FIXTURES_DIR/$engine/seeds/sample-db.sql"
+      ;;
+    mysql|mariadb)
+      spindb run "$container_name" -c "CREATE DATABASE IF NOT EXISTS testdb;" -d mysql &>/dev/null || true
+      seed_file="$FIXTURES_DIR/$engine/seeds/sample-db.sql"
+      ;;
+    clickhouse)
+      spindb run "$container_name" -c "CREATE DATABASE IF NOT EXISTS testdb;" -d default &>/dev/null || true
+      seed_file="$FIXTURES_DIR/$engine/seeds/sample-db.sql"
+      ;;
+    cockroachdb)
+      spindb run "$container_name" -c "CREATE DATABASE IF NOT EXISTS testdb;" -d defaultdb &>/dev/null || true
+      seed_file="$FIXTURES_DIR/$engine/seeds/sample-db.sql"
+      ;;
+    sqlite|duckdb)
+      seed_file="$FIXTURES_DIR/$engine/seeds/sample-db.sql"
+      ;;
+    mongodb)
+      seed_file="$FIXTURES_DIR/mongodb/seeds/sample-db.js"
+      ;;
+    ferretdb)
+      seed_file="$FIXTURES_DIR/ferretdb/seeds/sample-db.js"
+      ;;
+    redis)
+      seed_file="$FIXTURES_DIR/redis/seeds/sample-db.redis"
+      ;;
+    valkey)
+      seed_file="$FIXTURES_DIR/valkey/seeds/sample-db.valkey"
+      ;;
+    qdrant)
+      # Qdrant uses REST API - seed data via curl (no seed file needed)
+      seed_file=""
+      ;;
+    meilisearch)
+      # Meilisearch uses REST API - seed data via curl (no seed file needed)
+      seed_file=""
+      ;;
+    couchdb)
+      # CouchDB uses REST API - seed data via curl (no seed file needed)
+      seed_file=""
+      ;;
+    surrealdb)
+      seed_file="$FIXTURES_DIR/surrealdb/seeds/sample-db.surql"
+      ;;
+    questdb)
+      seed_file="$FIXTURES_DIR/questdb/seeds/sample-db.sql"
+      ;;
+    typedb)
+      # TypeDB uses .tqls console script format (includes transaction directives + db creation)
+      seed_file="$FIXTURES_DIR/typedb/seeds/sample-db.tqls"
+      ;;
+    influxdb)
+      # InfluxDB uses REST API for seeding (no seed file)
+      seed_file=""
+      ;;
+    weaviate)
+      # Weaviate uses REST API for seeding (no seed file)
+      seed_file=""
+      ;;
+    libsql)
+      # LibSQL uses REST API (Hrana protocol) for seeding (no seed file)
+      seed_file=""
+      ;;
+    tigerbeetle)
+      # TigerBeetle uses custom binary protocol - no seed file, skip seeding
+      return 0
+      ;;
+  esac
+
+  # InfluxDB uses REST API for seeding, not a file
+  if [ "$engine" = "influxdb" ]; then
+    local influxdb_port
+    influxdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$influxdb_port" ]; then
+      LAST_ERROR="Could not get InfluxDB port"
+      return 1
+    fi
+    # Write test data using line protocol (creates database implicitly, 5 records to match EXPECTED_COUNTS[influxdb]=5)
+    if ! curl -sf -X POST "http://127.0.0.1:${influxdb_port}/api/v3/write_lp?db=testdb" \
+      -H 'Content-Type: text/plain' \
+      -d 'test_user,id=1 name="Alice",email="alice@example.com"
+test_user,id=2 name="Bob",email="bob@example.com"
+test_user,id=3 name="Charlie",email="charlie@example.com"
+test_user,id=4 name="Diana",email="diana@example.com"
+test_user,id=5 name="Eve",email="eve@example.com"' &>/dev/null; then
+      LAST_ERROR="Failed to write InfluxDB seed data"
+      return 1
+    fi
+    # Allow time for data to be indexed
+    sleep 2
+    return 0
+  fi
+
+  # Weaviate uses REST API for seeding, not a file
+  if [ "$engine" = "weaviate" ]; then
+    local weaviate_port
+    weaviate_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$weaviate_port" ]; then
+      LAST_ERROR="Could not get Weaviate port"
+      return 1
+    fi
+    # Create class
+    if ! curl -sf -X POST "http://127.0.0.1:${weaviate_port}/v1/schema" \
+      -H 'Content-Type: application/json' \
+      -d '{"class": "TestVectors", "vectorizer": "none", "properties": [{"name": "name", "dataType": ["text"]}, {"name": "city", "dataType": ["text"]}]}' &>/dev/null; then
+      LAST_ERROR="Failed to create Weaviate class"
+      return 1
+    fi
+    # Insert test objects (3 objects to match EXPECTED_COUNTS[weaviate]=3)
+    if ! curl -sf -X POST "http://127.0.0.1:${weaviate_port}/v1/batch/objects" \
+      -H 'Content-Type: application/json' \
+      -d '{"objects": [
+        {"class": "TestVectors", "properties": {"name": "Alice", "city": "NYC"}, "vector": [0.1, 0.2, 0.3, 0.4]},
+        {"class": "TestVectors", "properties": {"name": "Bob", "city": "LA"}, "vector": [0.2, 0.3, 0.4, 0.5]},
+        {"class": "TestVectors", "properties": {"name": "Charlie", "city": "SF"}, "vector": [0.9, 0.8, 0.7, 0.6]}
+      ]}' &>/dev/null; then
+      LAST_ERROR="Failed to insert Weaviate objects"
+      return 1
+    fi
+    return 0
+  fi
+
+  # LibSQL uses REST API (Hrana protocol) for seeding, not a file
+  if [ "$engine" = "libsql" ]; then
+    local libsql_port
+    libsql_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$libsql_port" ]; then
+      LAST_ERROR="Could not get LibSQL port"
+      return 1
+    fi
+    # Create table and insert test data via Hrana protocol (5 records to match EXPECTED_COUNTS[libsql]=5)
+    if ! curl -sf -X POST "http://127.0.0.1:${libsql_port}/v2/pipeline" \
+      -H 'Content-Type: application/json' \
+      -d '{"requests": [
+        {"type": "execute", "stmt": {"sql": "CREATE TABLE IF NOT EXISTS test_user (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"}},
+        {"type": "execute", "stmt": {"sql": "INSERT INTO test_user (id, name, email) VALUES (1, '\''Alice'\'', '\''alice@example.com'\'')"}},
+        {"type": "execute", "stmt": {"sql": "INSERT INTO test_user (id, name, email) VALUES (2, '\''Bob'\'', '\''bob@example.com'\'')"}},
+        {"type": "execute", "stmt": {"sql": "INSERT INTO test_user (id, name, email) VALUES (3, '\''Charlie'\'', '\''charlie@example.com'\'')"}},
+        {"type": "execute", "stmt": {"sql": "INSERT INTO test_user (id, name, email) VALUES (4, '\''Diana'\'', '\''diana@example.com'\'')"}},
+        {"type": "execute", "stmt": {"sql": "INSERT INTO test_user (id, name, email) VALUES (5, '\''Eve'\'', '\''eve@example.com'\'')"}},
+        {"type": "close"}
+      ]}' &>/dev/null; then
+      LAST_ERROR="Failed to insert LibSQL seed data"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Qdrant uses REST API for seeding, not a file
+  if [ "$engine" = "qdrant" ]; then
+    local qdrant_port
+    qdrant_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$qdrant_port" ]; then
+      LAST_ERROR="Could not get Qdrant port"
+      return 1
+    fi
+    # Create collection
+    if ! curl -sf -X PUT "http://127.0.0.1:${qdrant_port}/collections/test_vectors" \
+      -H 'Content-Type: application/json' \
+      -d '{"vectors": {"size": 4, "distance": "Cosine"}}' &>/dev/null; then
+      LAST_ERROR="Failed to create Qdrant collection"
+      return 1
+    fi
+    # Insert test points (3 points to match EXPECTED_COUNTS[qdrant]=3)
+    if ! curl -sf -X PUT "http://127.0.0.1:${qdrant_port}/collections/test_vectors/points" \
+      -H 'Content-Type: application/json' \
+      -d '{"points": [
+        {"id": 1, "vector": [0.1, 0.2, 0.3, 0.4], "payload": {"name": "Alice", "city": "NYC"}},
+        {"id": 2, "vector": [0.2, 0.3, 0.4, 0.5], "payload": {"name": "Bob", "city": "LA"}},
+        {"id": 3, "vector": [0.9, 0.8, 0.7, 0.6], "payload": {"name": "Charlie", "city": "SF"}}
+      ]}' &>/dev/null; then
+      LAST_ERROR="Failed to insert Qdrant points"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Meilisearch uses REST API for seeding, not a file
+  if [ "$engine" = "meilisearch" ]; then
+    local meili_port
+    meili_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$meili_port" ]; then
+      LAST_ERROR="Could not get Meilisearch port"
+      return 1
+    fi
+    # Create index
+    if ! curl -sf -X POST "http://127.0.0.1:${meili_port}/indexes" \
+      -H 'Content-Type: application/json' \
+      -d '{"uid": "test_documents", "primaryKey": "id"}' &>/dev/null; then
+      LAST_ERROR="Failed to create Meilisearch index"
+      return 1
+    fi
+    # Wait for index creation
+    sleep 2
+    # Insert test documents (3 documents to match EXPECTED_COUNTS[meilisearch]=3)
+    if ! curl -sf -X POST "http://127.0.0.1:${meili_port}/indexes/test_documents/documents" \
+      -H 'Content-Type: application/json' \
+      -d '[
+        {"id": 1, "title": "Hello World", "content": "First document"},
+        {"id": 2, "title": "Second Post", "content": "Second document"},
+        {"id": 3, "title": "Third Entry", "content": "Third document"}
+      ]' &>/dev/null; then
+      LAST_ERROR="Failed to insert Meilisearch documents"
+      return 1
+    fi
+    # Wait for indexing
+    sleep 2
+    return 0
+  fi
+
+  # CouchDB uses REST API for seeding, not a file
+  if [ "$engine" = "couchdb" ]; then
+    local couchdb_port
+    couchdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+    if [ -z "$couchdb_port" ]; then
+      LAST_ERROR="Could not get CouchDB port"
+      return 1
+    fi
+    # Create database (CouchDB 3.x requires admin auth)
+    if ! curl -sf -u "admin:admin" -X PUT "http://127.0.0.1:${couchdb_port}/testdb" &>/dev/null; then
+      LAST_ERROR="Failed to create CouchDB database"
+      return 1
+    fi
+    # Insert test documents (5 documents to match EXPECTED_COUNTS[couchdb]=5)
+    if ! curl -sf -u "admin:admin" -X POST "http://127.0.0.1:${couchdb_port}/testdb/_bulk_docs" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "docs": [
+          {"_id": "user1", "name": "Alice", "age": 30},
+          {"_id": "user2", "name": "Bob", "age": 25},
+          {"_id": "user3", "name": "Charlie", "age": 35},
+          {"_id": "user4", "name": "Diana", "age": 28},
+          {"_id": "user5", "name": "Eve", "age": 32}
+        ]
+      }' &>/dev/null; then
+      LAST_ERROR="Failed to insert CouchDB documents"
+      return 1
+    fi
+    return 0
+  fi
+
+  if [ ! -f "$seed_file" ]; then
+    LAST_ERROR="Seed file not found: $seed_file"
+    return 1
+  fi
+
+  case $engine in
+    sqlite|duckdb|redis|valkey)
+      run_cmd spindb run "$container_name" "$seed_file"
+      ;;
+    surrealdb)
+      # SurrealDB uses namespace 'test' and database 'test'
+      run_cmd spindb run "$container_name" "$seed_file" -d test
+      ;;
+    questdb)
+      # QuestDB uses 'qdb' as the default database
+      run_cmd spindb run "$container_name" "$seed_file" -d qdb
+      ;;
+    typedb)
+      # TypeDB .tqls script includes database creation and transactions
+      run_cmd spindb run "$container_name" "$seed_file"
+      ;;
+    *)
+      run_cmd spindb run "$container_name" "$seed_file" -d testdb
+      ;;
+  esac
+}
+
+get_data_count() {
+  local engine=$1 container_name=$2 database=${3:-testdb}
+  local output
+  local error_output
+  case $engine in
+    postgresql|mysql|mariadb|clickhouse|cockroachdb)
+      output=$(spindb run "$container_name" -c "SELECT COUNT(*) FROM test_user;" -d "$database" 2>/dev/null)
+      # Extract number from output (handles various formats with whitespace)
+      echo "$output" | grep -oE '[0-9]+' | head -1
+      ;;
+    sqlite)
+      # SQLite outputs plain number
+      output=$(spindb run "$container_name" -c "SELECT COUNT(*) FROM test_user;" 2>/dev/null)
+      echo "$output" | grep -oE '[0-9]+' | head -1
+      ;;
+    duckdb)
+      # DuckDB outputs a table with box drawing chars, extract the count from data row
+      # Find lines that contain a standalone integer (not "int64" header)
+      output=$(spindb run "$container_name" -c "SELECT COUNT(*) FROM test_user;" 2>/dev/null)
+      local count=""
+      # Match lines with optional borders/whitespace around a number, excluding header
+      count=$(echo "$output" | grep -v 'int64' | grep -oE '(^|[^0-9])[0-9]+([^0-9]|$)' | grep -oE '[0-9]+' | head -1)
+      # If parsing fails, log output for debugging (only when VERBOSE) and return empty
+      if [ -z "$count" ] && [ "$VERBOSE" = "true" ]; then
+        echo "DEBUG: DuckDB output parsing failed. Raw output:" >&2
+        echo "$output" >&2
+      fi
+      echo "$count"
+      ;;
+    mongodb|ferretdb)
+      output=$(spindb run "$container_name" -c "db.test_user.countDocuments()" -d "$database" 2>/dev/null)
+      echo "$output" | grep -oE '[0-9]+' | head -1
+      ;;
+    redis|valkey)
+      output=$(spindb run "$container_name" -c "DBSIZE" -d "$database" 2>/dev/null)
+      echo "$output" | grep -oE '[0-9]+' | head -1
+      ;;
+    qdrant)
+      # Qdrant uses REST API - get point count via curl
+      local qdrant_port
+      qdrant_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$qdrant_port" ]; then
+        output=$(curl -sf "http://127.0.0.1:${qdrant_port}/collections/test_vectors" 2>/dev/null)
+        echo "$output" | jq -r '.result.points_count' 2>/dev/null
+      fi
+      ;;
+    meilisearch)
+      # Meilisearch uses REST API - get document count via curl
+      local meili_port
+      meili_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$meili_port" ]; then
+        output=$(curl -sf "http://127.0.0.1:${meili_port}/indexes/test_documents/stats" 2>/dev/null)
+        echo "$output" | jq -r '.numberOfDocuments' 2>/dev/null
+      fi
+      ;;
+    couchdb)
+      # CouchDB uses REST API - get document count via curl (requires admin auth)
+      local couchdb_port
+      couchdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$couchdb_port" ]; then
+        output=$(curl -sf -u "admin:admin" "http://127.0.0.1:${couchdb_port}/${database}" 2>/dev/null)
+        echo "$output" | jq -r '.doc_count' 2>/dev/null
+      fi
+      ;;
+    surrealdb)
+      # SurrealDB uses surreal sql to query
+      output=$(spindb run "$container_name" -c "SELECT count() FROM test_user GROUP ALL" -d "$database" 2>/dev/null)
+      # Parse JSON output: [[{"result":[{"count":5}],...}]]
+      echo "$output" | grep -oE '"count":[0-9]+' | grep -oE '[0-9]+' | head -1
+      ;;
+    questdb)
+      # QuestDB uses PostgreSQL wire protocol, query via psql
+      output=$(spindb run "$container_name" -c "SELECT COUNT(*) FROM test_user;" -d "$database" 2>/dev/null)
+      echo "$output" | grep -oE '[0-9]+' | head -1
+      ;;
+    typedb)
+      # TypeDB console --command mode doesn't support multi-step transaction flows;
+      # each --command is a standalone top-level command. Use temp script for queries.
+      local typedb_port
+      typedb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$typedb_port" ]; then
+        output=$(spindb which typedb_console_bin 2>/dev/null)
+        if [ -n "$output" ] && [ -f "$output" ]; then
+          local count_script
+          count_script=$(mktemp /tmp/spindb-typedb-count-XXXXXX.tqls)
+          printf 'transaction read %s\n\nmatch $u isa test_user; reduce $c = count;\n\nclose\n' "$database" > "$count_script"
+          local count_output
+          count_output=$("$output" --address "127.0.0.1:${typedb_port}" --tls-disabled --username admin --password password \
+            --script "$count_script" 2>/dev/null)
+          rm -f "$count_script"
+          echo "$count_output" | grep -oE '[0-9]+' | head -1
+        fi
+      fi
+      ;;
+    influxdb)
+      # InfluxDB uses REST API - get record count via SQL query
+      local influxdb_port
+      influxdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$influxdb_port" ]; then
+        output=$(curl -sf -X POST "http://127.0.0.1:${influxdb_port}/api/v3/query_sql" \
+          -H 'Content-Type: application/json' \
+          -d "{\"db\":\"${database}\",\"q\":\"SELECT COUNT(*) as count FROM test_user\",\"format\":\"json\"}" 2>/dev/null)
+        echo "$output" | jq -r '.[0].count // empty' 2>/dev/null
+      fi
+      ;;
+    weaviate)
+      # Weaviate uses REST API - get object count from schema
+      local weaviate_port
+      weaviate_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$weaviate_port" ]; then
+        output=$(curl -sf "http://127.0.0.1:${weaviate_port}/v1/objects?class=TestVectors&limit=0" 2>/dev/null)
+        echo "$output" | jq -r '.totalResults // empty' 2>/dev/null
+      fi
+      ;;
+    libsql)
+      # LibSQL uses REST API (Hrana protocol) - get record count via HTTP
+      local libsql_port
+      libsql_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$libsql_port" ]; then
+        output=$(curl -sf -X POST "http://127.0.0.1:${libsql_port}/v2/pipeline" \
+          -H 'Content-Type: application/json' \
+          -d '{"requests": [{"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as count FROM test_user"}}, {"type": "close"}]}' 2>/dev/null)
+        echo "$output" | jq -r '.results[0].response.result.rows[0][0].value // empty' 2>/dev/null
+      fi
+      ;;
+    tigerbeetle)
+      # TigerBeetle uses custom binary protocol - no data count available
+      echo "0"
+      ;;
+  esac
+}
+
+# Map format name to file extension (engine-specific)
+# Based on config/backup-formats.ts with semantic format names
+get_backup_extension() {
+  local engine=$1 format=$2
+  case $engine in
+    postgresql)
+      case $format in
+        sql) echo ".sql" ;;
+        custom) echo ".dump" ;;
+      esac
+      ;;
+    mysql|mariadb)
+      case $format in
+        sql) echo ".sql" ;;
+        compressed) echo ".sql.gz" ;;
+      esac
+      ;;
+    sqlite)
+      case $format in
+        sql) echo ".sql" ;;
+        binary) echo ".sqlite" ;;
+      esac
+      ;;
+    duckdb)
+      case $format in
+        sql) echo ".sql" ;;
+        binary) echo ".duckdb" ;;
+      esac
+      ;;
+    mongodb)
+      case $format in
+        bson) echo "" ;;  # directory (BSON)
+        archive) echo ".archive" ;;
+      esac
+      ;;
+    redis)
+      case $format in
+        text) echo ".redis" ;;
+        rdb) echo ".rdb" ;;
+      esac
+      ;;
+    valkey)
+      case $format in
+        text) echo ".valkey" ;;
+        rdb) echo ".rdb" ;;
+      esac
+      ;;
+    clickhouse|cockroachdb|questdb)
+      echo ".sql" ;;
+    qdrant)
+      # Qdrant uses snapshot format for backups
+      echo ".snapshot" ;;
+    meilisearch)
+      # Meilisearch uses snapshot format for backups
+      echo ".snapshot" ;;
+    couchdb)
+      # CouchDB uses JSON format for backups
+      echo ".json" ;;
+    surrealdb)
+      # SurrealDB uses SurrealQL format for backups
+      echo ".surql" ;;
+    typedb)
+      # TypeDB uses TypeQL format for backups
+      echo ".typeql" ;;
+    influxdb)
+      # InfluxDB uses SQL format for backups
+      echo ".sql" ;;
+    weaviate)
+      # Weaviate uses snapshot format for backups
+      echo ".snapshot" ;;
+    tigerbeetle)
+      # TigerBeetle uses binary data file for backups
+      echo ".tigerbeetle" ;;
+    libsql)
+      case $format in
+        sql) echo ".sql" ;;
+        binary) echo ".db" ;;
+      esac
+      ;;
+    *)
+      echo ".$format" ;;
+  esac
+}
+
+# Get full backup file path
+get_backup_path() {
+  local engine=$1 container_name=$2 format=$3
+  local ext=$(get_backup_extension "$engine" "$format")
+  echo "$BACKUP_DIR/${container_name}_backup${ext}"
+}
+
+create_backup() {
+  local engine=$1 container_name=$2 format=$3
+  local backup_name="${container_name}_backup"
+
+  case $engine in
+    postgresql|mysql|mariadb|clickhouse|mongodb|cockroachdb)
+      run_cmd spindb backup "$container_name" -d testdb --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    redis|valkey)
+      # Redis/Valkey: sql format = text commands (.redis/.valkey), dump format = RDB snapshot (.rdb)
+      run_cmd spindb backup "$container_name" -d 0 --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    sqlite|duckdb)
+      run_cmd spindb backup "$container_name" --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    surrealdb)
+      run_cmd spindb backup "$container_name" -d test --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    questdb)
+      # QuestDB uses 'qdb' as the default database
+      run_cmd spindb backup "$container_name" -d qdb --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    typedb)
+      # TypeDB exports schema + data from test_tdb (seed file creates this database)
+      run_cmd spindb backup "$container_name" -d test_tdb --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    influxdb)
+      # InfluxDB exports data via REST API SQL dump
+      run_cmd spindb backup "$container_name" -d testdb --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    weaviate)
+      # Weaviate uses snapshot format for full backups
+      run_cmd spindb backup "$container_name" --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    tigerbeetle)
+      # TigerBeetle uses stop-and-copy backup of data file
+      run_cmd spindb backup "$container_name" --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+    libsql)
+      # LibSQL: single database per instance, no -d flag needed
+      run_cmd spindb backup "$container_name" --format "$format" -o "$BACKUP_DIR" -n "$backup_name"
+      ;;
+  esac
+}
+
+create_restore_target() {
+  local engine=$1 container_name=$2
+  case $engine in
+    postgresql)
+      run_cmd spindb run "$container_name" -c "CREATE DATABASE restored_db;" -d postgres
+      ;;
+    mysql|mariadb)
+      run_cmd spindb run "$container_name" -c "CREATE DATABASE restored_db;" -d mysql
+      ;;
+    clickhouse)
+      run_cmd spindb run "$container_name" -c "CREATE DATABASE IF NOT EXISTS restored_db;" -d default
+      ;;
+    cockroachdb)
+      run_cmd spindb run "$container_name" -c "CREATE DATABASE IF NOT EXISTS restored_db;" -d defaultdb
+      ;;
+    sqlite|duckdb)
+      local restored_container="restored_${container_name}"
+      local restored_path="$BACKUP_DIR/restored_${engine}.db"
+      run_cmd spindb create "$restored_container" --engine "$engine" --path "$restored_path" --no-start
+      ;;
+    surrealdb)
+      # SurrealDB: restore goes to a separate database (restored_db) for verification
+      # No explicit target creation needed - SurrealDB creates databases on import
+      return 0
+      ;;
+    questdb)
+      # QuestDB: Tables are created in the same qdb database, no explicit target needed
+      return 0
+      ;;
+    typedb)
+      # TypeDB: import creates the database, no explicit target needed
+      return 0
+      ;;
+    influxdb)
+      # InfluxDB: databases created implicitly on first write, no explicit target needed
+      return 0
+      ;;
+    weaviate)
+      # Weaviate: snapshot restore replaces entire data directory, no explicit target needed
+      return 0
+      ;;
+    tigerbeetle)
+      # TigerBeetle: binary restore replaces data file, no explicit target needed
+      return 0
+      ;;
+    libsql)
+      # LibSQL: single database per instance, restore replaces data, no explicit target needed
+      return 0
+      ;;
+    *)
+      # MongoDB, Redis, Valkey don't need explicit target creation
+      return 0
+      ;;
+  esac
+}
+
+restore_backup() {
+  local engine=$1 container_name=$2 format=$3
+  local backup_file=$(get_backup_path "$engine" "$container_name" "$format")
+
+  case $engine in
+    postgresql|mysql|mariadb|clickhouse|mongodb|cockroachdb)
+      run_cmd spindb restore "$container_name" "$backup_file" -d restored_db --force
+      ;;
+    redis|valkey)
+      # text format can be restored while running, rdb format requires stop/start
+      if [ "$format" = "text" ]; then
+        run_cmd spindb restore "$container_name" "$backup_file" -d 1 --force
+      else
+        spindb stop "$container_name" &>/dev/null || true
+        # Wait for container to fully stop before restore
+        local max_wait=30
+        local waited=0
+        while spindb info "$container_name" --json 2>/dev/null | grep -q '"status":"running"' && [ $waited -lt $max_wait ]; do
+          sleep 1
+          waited=$((waited + 1))
+        done
+        # Abort if stop timed out (container still running)
+        if spindb info "$container_name" --json 2>/dev/null | grep -q '"status":"running"'; then
+          echo "ERROR: Container $container_name did not stop within ${max_wait}s, cannot restore RDB"
+          return 1
+        fi
+        if ! run_cmd spindb restore "$container_name" "$backup_file" --force; then
+          return 1
+        fi
+        if ! run_cmd spindb start "$container_name"; then
+          return 1
+        fi
+        # Give the container a moment to register as running
+        sleep 2
+        # Wait for container to be ready after start
+        waited=0
+        while ! spindb info "$container_name" --json 2>/dev/null | grep -q '"status":"running"' && [ $waited -lt $max_wait ]; do
+          sleep 1
+          waited=$((waited + 1))
+        done
+        # The container should be running by now - if not, just log for debugging
+        # but don't fail since the data verification will catch actual issues
+        if ! spindb info "$container_name" --json 2>/dev/null | grep -q '"status":"running"' && [ "$VERBOSE" = "true" ]; then
+          log_verbose "Container $container_name status not 'running' after ${max_wait}s (may be false negative)"
+        fi
+      fi
+      ;;
+    sqlite|duckdb)
+      local restored_container="restored_${container_name}"
+      run_cmd spindb restore "$restored_container" "$backup_file" --force
+      ;;
+    surrealdb)
+      run_cmd spindb restore "$container_name" "$backup_file" -d restored_db --force
+      ;;
+    questdb)
+      run_cmd spindb restore "$container_name" "$backup_file" -d qdb --force
+      ;;
+    typedb)
+      # TypeDB import creates the database from the backup
+      run_cmd spindb restore "$container_name" "$backup_file" -d restored_db --force
+      ;;
+    influxdb)
+      # InfluxDB restore executes SQL statements via REST API
+      run_cmd spindb restore "$container_name" "$backup_file" -d restored_db --force
+      ;;
+    weaviate)
+      # Weaviate: snapshot restore replaces data directory
+      run_cmd spindb restore "$container_name" "$backup_file" --force
+      ;;
+    tigerbeetle)
+      # TigerBeetle: binary restore replaces data file
+      run_cmd spindb restore "$container_name" "$backup_file" --force
+      ;;
+    libsql)
+      # LibSQL: restore replaces data (single database per instance)
+      run_cmd spindb restore "$container_name" "$backup_file" --force
+      ;;
+  esac
+}
+
+verify_restored_data() {
+  local engine=$1 container_name=$2 format=$3
+  local expected=${EXPECTED_COUNTS[$engine]}
+  local actual=""
+
+  case $engine in
+    postgresql|mysql|mariadb|clickhouse|mongodb|cockroachdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    redis|valkey)
+      # text format restores to database 1, rdb format restores to database 0
+      if [ "$format" = "text" ]; then
+        actual=$(get_data_count "$engine" "$container_name" "1")
+      else
+        actual=$(get_data_count "$engine" "$container_name" "0")
+      fi
+      ;;
+    sqlite|duckdb)
+      actual=$(get_data_count "$engine" "restored_${container_name}")
+      ;;
+    surrealdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    questdb)
+      actual=$(get_data_count "$engine" "$container_name" "qdb")
+      ;;
+    typedb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    influxdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    weaviate)
+      # Weaviate snapshot restore replaces the entire data directory
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+    tigerbeetle)
+      # TigerBeetle binary restore replaces data file
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+    libsql)
+      # LibSQL: single database per instance, data replaced by restore
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+  esac
+
+  actual=$(echo "$actual" | tr -d '[:space:]')
+  [ "$actual" = "$expected" ]
+}
+
+# Same as verify_restored_data but echoes the actual count for debugging
+verify_restored_data_with_count() {
+  local engine=$1 container_name=$2 format=$3
+  local expected=${EXPECTED_COUNTS[$engine]}
+  local actual=""
+
+  case $engine in
+    postgresql|mysql|mariadb|clickhouse|mongodb|cockroachdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    redis|valkey)
+      # text format restores to database 1, rdb format restores to database 0
+      if [ "$format" = "text" ]; then
+        actual=$(get_data_count "$engine" "$container_name" "1")
+      else
+        actual=$(get_data_count "$engine" "$container_name" "0")
+      fi
+      ;;
+    sqlite|duckdb)
+      actual=$(get_data_count "$engine" "restored_${container_name}")
+      ;;
+    surrealdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    questdb)
+      actual=$(get_data_count "$engine" "$container_name" "qdb")
+      ;;
+    typedb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    influxdb)
+      actual=$(get_data_count "$engine" "$container_name" "restored_db")
+      ;;
+    weaviate)
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+    tigerbeetle)
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+    libsql)
+      actual=$(get_data_count "$engine" "$container_name" "default")
+      ;;
+  esac
+
+  actual=$(echo "$actual" | tr -d '[:space:]')
+  echo "$actual"
+  [ "$actual" = "$expected" ]
+}
+
+cleanup_restore_target() {
+  local engine=$1 container_name=$2
+  case $engine in
+    postgresql)
+      spindb run "$container_name" -c "DROP DATABASE IF EXISTS restored_db;" -d postgres &>/dev/null || true
+      ;;
+    mysql|mariadb)
+      spindb run "$container_name" -c "DROP DATABASE IF EXISTS restored_db;" -d mysql &>/dev/null || true
+      ;;
+    clickhouse)
+      spindb run "$container_name" -c "DROP DATABASE IF EXISTS restored_db;" -d default &>/dev/null || true
+      ;;
+    cockroachdb)
+      spindb run "$container_name" -c "DROP DATABASE IF EXISTS restored_db;" -d defaultdb &>/dev/null || true
+      ;;
+    sqlite|duckdb)
+      spindb delete "restored_${container_name}" --yes &>/dev/null || true
+      ;;
+    surrealdb)
+      # SurrealDB: remove the restored database
+      spindb run "$container_name" -c "REMOVE DATABASE restored_db;" -d test &>/dev/null || true
+      ;;
+    questdb)
+      # QuestDB: tables are stored in qdb, cleanup would drop the table but we skip it
+      # since the container will be deleted anyway
+      ;;
+    typedb)
+      # TypeDB: delete the restored database via console directly
+      # (spindb run -c wraps in transaction context which doesn't work for database commands)
+      local typedb_port
+      typedb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$typedb_port" ]; then
+        local console_bin
+        console_bin=$(spindb which typedb_console_bin 2>/dev/null)
+        if [ -n "$console_bin" ] && [ -f "$console_bin" ]; then
+          "$console_bin" --address "127.0.0.1:${typedb_port}" --tls-disabled --username admin --password password \
+            --command "database delete restored_db" &>/dev/null || true
+        fi
+      fi
+      ;;
+    influxdb)
+      # InfluxDB: drop tables in restored database via REST API
+      local influxdb_port
+      influxdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$influxdb_port" ]; then
+        curl -sf -X POST "http://127.0.0.1:${influxdb_port}/api/v3/query_sql" \
+          -H 'Content-Type: application/json' \
+          -d '{"db":"restored_db","q":"DROP TABLE test_user","format":"json"}' &>/dev/null || true
+      fi
+      ;;
+    weaviate)
+      # Weaviate: no cleanup needed for snapshot restore (replaces full data)
+      ;;
+    tigerbeetle)
+      # TigerBeetle: no cleanup needed for binary restore (replaces data file)
+      ;;
+    libsql)
+      # LibSQL: no cleanup needed for restore (single database, replaces data)
+      ;;
+  esac
+}
+
+cleanup_data_lifecycle() {
+  local engine=$1 container_name=$2
+  case $engine in
+    sqlite|duckdb)
+      spindb delete "restored_${container_name}" --yes &>/dev/null || true
+      ;;
+  esac
+  rm -rf "$BACKUP_DIR"/${container_name}_backup* &>/dev/null || true
+}
+
+# ============================================================================
+# TEST BACKUP FORMAT
+# ============================================================================
+
+show_error_details() {
+  if [ -n "$LAST_ERROR" ]; then
+    echo ""
+    echo "  ${RED}Error details:${RESET}"
+    echo "$LAST_ERROR" | head -20 | sed 's/^/    /'
+    echo ""
+  fi
+}
+
+test_backup_format() {
+  local engine=$1 container_name=$2 format=$3
+
+  log_step "Backup ($format)"
+  if ! create_backup "$engine" "$container_name" "$format"; then
+    log_step_fail
+    show_error_details
+    return 1
+  fi
+  log_step_ok
+
+  log_step "Create restore target"
+  if ! create_restore_target "$engine" "$container_name"; then
+    log_step_fail
+    show_error_details
+    return 1
+  fi
+  log_step_ok
+
+  log_step "Restore ($format)"
+  if ! restore_backup "$engine" "$container_name" "$format"; then
+    log_step_fail
+    show_error_details
+    return 1
+  fi
+  log_step_ok
+
+  log_step "Verify data integrity"
+  local verify_result
+  verify_result=$(verify_restored_data_with_count "$engine" "$container_name" "$format")
+  local verify_status=$?
+  if [ $verify_status -ne 0 ]; then
+    log_step_result "fail" "got $verify_result, expected ${EXPECTED_COUNTS[$engine]}"
+    return 1
+  fi
+  log_step_result "ok" "${EXPECTED_COUNTS[$engine]} records"
+
+  # Cleanup for next format test
+  cleanup_restore_target "$engine" "$container_name"
+  return 0
+}
+
+# ============================================================================
+# UTILITY TEST: SELF-UPDATE
+# ============================================================================
+
+run_self_update_test() {
+  # Version to install before testing self-update. Override via OLD_VERSION env var.
+  # Bump this default when older versions become incompatible with current tests.
+  local old_version="${OLD_VERSION:-0.19.4}"
+  local test_name="self-update"
+
+  log_header "Self-Update Test"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 1: Install old version
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Install Old Version"
+
+  log_step "Install spindb@$old_version via pnpm"
+  if ! run_cmd pnpm add -g "spindb@$old_version"; then
+    log_step_fail
+    show_error_details
+    record_result "$test_name" "$old_version" "FAILED" "Failed to install old version"
+    print_engine_result "$test_name" "$old_version" "FAILED" "Failed to install old version"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  log_step "Verify installed version"
+  local installed_version
+  installed_version=$(spindb version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ "$installed_version" != "$old_version" ]; then
+    log_step_result "fail" "got $installed_version, expected $old_version"
+    pnpm remove -g spindb &>/dev/null || true
+    record_result "$test_name" "$old_version" "FAILED" "Version mismatch after install"
+    print_engine_result "$test_name" "$old_version" "FAILED" "Version mismatch after install"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_result "ok" "v$installed_version"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 2: Run self-update
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Run Self-Update"
+
+  log_step "Execute spindb update -y"
+  if ! run_cmd spindb update -y; then
+    log_step_fail
+    show_error_details
+    pnpm remove -g spindb &>/dev/null || true
+    record_result "$test_name" "$old_version" "FAILED" "Self-update command failed"
+    print_engine_result "$test_name" "$old_version" "FAILED" "Self-update command failed"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 3: Verify update
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Verify Update"
+
+  log_step "Check version changed"
+  local new_version
+  new_version=$(spindb version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+  if [ -z "$new_version" ]; then
+    log_step_result "fail" "could not get version"
+    pnpm remove -g spindb &>/dev/null || true
+    record_result "$test_name" "$old_version" "FAILED" "Version check failed after update"
+    print_engine_result "$test_name" "$old_version" "FAILED" "Version check failed after update"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+
+  if [ "$new_version" = "$old_version" ]; then
+    log_step_result "fail" "still v$old_version"
+    pnpm remove -g spindb &>/dev/null || true
+    record_result "$test_name" "$old_version" "FAILED" "Version unchanged after update"
+    print_engine_result "$test_name" "$old_version" "FAILED" "Version unchanged after update"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_result "ok" "v$old_version → v$new_version"
+
+  log_step "Verify CLI still works"
+  if ! spindb --help &>/dev/null; then
+    log_step_fail
+    pnpm remove -g spindb &>/dev/null || true
+    record_result "$test_name" "$old_version" "FAILED" "CLI broken after update"
+    print_engine_result "$test_name" "$old_version" "FAILED" "CLI broken after update"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 4: Cleanup
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Cleanup"
+
+  log_step "Uninstall spindb"
+  pnpm remove -g spindb &>/dev/null || true
+  log_step_ok
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Success!
+  # ─────────────────────────────────────────────────────────────────────────
+  record_result "$test_name" "$old_version → $new_version" "PASSED" "" "updated successfully"
+  print_engine_result "$test_name" "$old_version → $new_version" "PASSED"
+  PASSED=$((PASSED+1))
+  return 0
+}
+
+# ============================================================================
+# MAIN TEST FUNCTION
+# ============================================================================
+
+run_test() {
+  local engine=$1
+  local version=$2
+  local container_name="e2e_${engine}_$$"
+  local test_details=""
+  local failure_reason=""
+  local is_file_based=false
+
+  # Set default test_details based on mode
+  if [ "$SMOKE_TEST" = "true" ]; then
+    test_details="smoke test"
+  fi
+
+  # Track for cleanup on interrupt
+  CURRENT_CONTAINER="$container_name"
+
+  [ "$engine" = "sqlite" ] || [ "$engine" = "duckdb" ] && is_file_based=true
+
+  log_header "$engine v$version"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 1: Download
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Download Binaries"
+
+  log_step "Download $engine $version from hostdb"
+  local download_output
+  if ! download_output=$(spindb engines download "$engine" "$version" 2>&1); then
+    log_step_fail
+    # Show the actual error for debugging
+    if [ -n "$download_output" ]; then
+      echo ""
+      echo "  ${RED}Download error output:${RESET}"
+      echo "$download_output" | sed 's/^/    /'
+      echo ""
+    fi
+    failure_reason="Binary download failed"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  # QuestDB requires psql for connectivity tests (PostgreSQL wire protocol)
+  if [ "$engine" = "questdb" ]; then
+    log_step "Download postgresql 17 for psql (QuestDB dependency)"
+    if ! spindb engines download postgresql 17 &>/dev/null; then
+      log_step_fail
+      failure_reason="PostgreSQL download failed (needed for psql)"
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 2: Container Lifecycle
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Container Lifecycle"
+
+  log_step "Create container"
+  local create_output
+  if ! create_output=$(spindb create "$container_name" --engine "$engine" --db-version "$version" --no-start 2>&1); then
+    log_step_fail
+    # Show the actual error for debugging
+    if [ -n "$create_output" ]; then
+      echo ""
+      echo "  ${RED}Create error output:${RESET}"
+      echo "$create_output" | sed 's/^/    /'
+      echo ""
+    fi
+    failure_reason="Container creation failed"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  if [ "$is_file_based" = "false" ]; then
+    log_step "Start container"
+    local start_output
+    local start_exit_code
+    local start_timeout="$START_TIMEOUT"
+    # Use timeout command if available (Linux), otherwise run without timeout (macOS for local testing)
+    # Wrap in `if` to prevent `set -e` from aborting the script on non-zero exit.
+    # Without this, a failed `spindb start` inside $(...) causes the script to exit
+    # immediately via the EXIT trap, skipping the error handler below.
+    if command -v timeout &>/dev/null; then
+      if start_output=$(timeout --foreground "$start_timeout" spindb start "$container_name" 2>&1); then
+        start_exit_code=0
+      else
+        start_exit_code=$?
+      fi
+    else
+      # macOS doesn't have timeout command by default
+      if start_output=$(spindb start "$container_name" 2>&1); then
+        start_exit_code=0
+      else
+        start_exit_code=$?
+      fi
+    fi
+
+    if [ $start_exit_code -ne 0 ]; then
+      log_step_fail
+      # Check if it was a timeout (exit code 124)
+      if [ $start_exit_code -eq 124 ]; then
+        echo ""
+        echo "  ${RED}Start command timed out after ${start_timeout}s${RESET}"
+      fi
+      echo "  ${RED}Exit code: ${start_exit_code}${RESET}"
+      # Show the actual error for debugging
+      if [ -n "$start_output" ]; then
+        echo ""
+        echo "  ${RED}Start error output:${RESET}"
+        echo "$start_output" | sed 's/^/    /'
+        echo ""
+      fi
+      # Dump container log file if it exists (critical for CI debugging)
+      local container_dir="${SPINDB_HOME:-$HOME/.spindb}/containers/$engine/$container_name"
+      local log_candidates=("$container_dir/logs/$engine.log" "$container_dir/$engine.log" "$container_dir/logs/postgres.log")
+      for log_candidate in "${log_candidates[@]}"; do
+        if [ -f "$log_candidate" ]; then
+          echo "  ${RED}Server log ($log_candidate):${RESET}"
+          tail -50 "$log_candidate" | sed 's/^/    /'
+          echo ""
+          break
+        fi
+      done
+      spindb delete "$container_name" --yes &>/dev/null || true
+      failure_reason="Container start failed (exit code: $start_exit_code)"
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+
+    log_step "Wait for ready"
+    local status="unknown"
+    for i in $(seq 1 "$STARTUP_TIMEOUT"); do
+      if status=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.status' 2>/dev/null); then
+        [ "$status" = "running" ] && break
+      fi
+      sleep 1
+    done
+
+    if [ "$status" != "running" ]; then
+      log_step_result "fail" "timeout after ${STARTUP_TIMEOUT}s"
+      spindb stop "$container_name" &>/dev/null || true
+      spindb delete "$container_name" --yes &>/dev/null || true
+      failure_reason="Container failed to become ready (status: $status)"
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+  else
+    log_step "Start container"
+    log_step_result "skip"
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 3: Connectivity Test
+  # ─────────────────────────────────────────────────────────────────────────
+  log_section "Connectivity"
+
+  log_step "Basic query test"
+  local query_ok=false
+  case $engine in
+    postgresql|mysql|mariadb|sqlite|duckdb|clickhouse|cockroachdb|questdb)
+      spindb run "$container_name" -c "SELECT 1;" &>/dev/null && query_ok=true
+      ;;
+    surrealdb)
+      # SurrealDB uses SurrealQL, not SQL - RETURN is the equivalent of SELECT for simple values
+      spindb run "$container_name" -c "RETURN 1;" &>/dev/null && query_ok=true
+      ;;
+    mongodb|ferretdb)
+      spindb run "$container_name" -c "db.runCommand({ping: 1})" &>/dev/null && query_ok=true
+      ;;
+    redis|valkey)
+      spindb run "$container_name" -c "PING" &>/dev/null && query_ok=true
+      ;;
+    qdrant)
+      # Qdrant uses REST API - check health endpoint via curl
+      local qdrant_port
+      qdrant_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$qdrant_port" ] && curl -sf "http://127.0.0.1:${qdrant_port}/healthz" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    meilisearch)
+      # Meilisearch uses REST API - check health endpoint via curl
+      local meili_port
+      meili_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$meili_port" ] && curl -sf "http://127.0.0.1:${meili_port}/health" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    couchdb)
+      # CouchDB uses REST API - check welcome endpoint via curl
+      local couchdb_port
+      couchdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$couchdb_port" ] && curl -sf "http://127.0.0.1:${couchdb_port}/" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    typedb)
+      # TypeDB uses HTTP endpoint for health check
+      local typedb_port
+      typedb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$typedb_port" ]; then
+        local http_port=$((typedb_port + TYPEDB_HTTP_PORT_OFFSET))
+        if curl -sf "http://127.0.0.1:${http_port}/health" &>/dev/null; then
+          query_ok=true
+        fi
+      fi
+      ;;
+    influxdb)
+      # InfluxDB uses REST API - check health endpoint via curl
+      local influxdb_port
+      influxdb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$influxdb_port" ] && curl -sf "http://127.0.0.1:${influxdb_port}/health" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    weaviate)
+      # Weaviate uses REST API - check ready endpoint via curl
+      local weaviate_port
+      weaviate_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$weaviate_port" ] && curl -sf "http://127.0.0.1:${weaviate_port}/v1/.well-known/ready" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    libsql)
+      # LibSQL uses REST API - check health endpoint via curl
+      local libsql_port
+      libsql_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$libsql_port" ] && curl -sf "http://127.0.0.1:${libsql_port}/health" &>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+    tigerbeetle)
+      # TigerBeetle uses custom binary protocol - check if port is listening
+      local tb_port
+      tb_port=$(spindb info "$container_name" --json 2>/dev/null | jq -r '.port' 2>/dev/null)
+      if [ -n "$tb_port" ] && (echo > "/dev/tcp/127.0.0.1/${tb_port}") 2>/dev/null; then
+        query_ok=true
+      fi
+      ;;
+  esac
+
+  if [ "$query_ok" = "false" ]; then
+    log_step_fail
+    [ "$is_file_based" = "false" ] && spindb stop "$container_name" &>/dev/null || true
+    spindb delete "$container_name" --yes &>/dev/null || true
+    failure_reason="Basic query failed"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 4: Data Lifecycle (Seed → Backup → Restore → Verify)
+  # Skipped in smoke test mode
+  # ─────────────────────────────────────────────────────────────────────────
+  if [ "$SMOKE_TEST" != "true" ]; then
+  log_section "Data Lifecycle"
+
+  log_step "Insert seed data"
+  if ! insert_seed_data "$engine" "$container_name"; then
+    log_step_fail
+    show_error_details
+    cleanup_data_lifecycle "$engine" "$container_name"
+    [ "$is_file_based" = "false" ] && spindb stop "$container_name" &>/dev/null || true
+    spindb delete "$container_name" --yes &>/dev/null || true
+    failure_reason="Seed data insertion failed"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_ok
+
+  log_step "Verify seed data"
+  local initial_count
+  case $engine in
+    sqlite|duckdb)
+      initial_count=$(get_data_count "$engine" "$container_name")
+      ;;
+    redis|valkey)
+      initial_count=$(get_data_count "$engine" "$container_name" "0")
+      ;;
+    surrealdb)
+      # SurrealDB seeds to database "test" (not "testdb")
+      initial_count=$(get_data_count "$engine" "$container_name" "test")
+      ;;
+    questdb)
+      # QuestDB uses "qdb" as the default database
+      initial_count=$(get_data_count "$engine" "$container_name" "qdb")
+      ;;
+    typedb)
+      # TypeDB seed file creates database "test_tdb"
+      initial_count=$(get_data_count "$engine" "$container_name" "test_tdb")
+      ;;
+    *)
+      initial_count=$(get_data_count "$engine" "$container_name" "testdb")
+      ;;
+  esac
+  initial_count=$(echo "$initial_count" | tr -d '[:space:]')
+
+  if [ "$initial_count" != "${EXPECTED_COUNTS[$engine]}" ]; then
+    log_step_result "fail" "got $initial_count, expected ${EXPECTED_COUNTS[$engine]}"
+    cleanup_data_lifecycle "$engine" "$container_name"
+    [ "$is_file_based" = "false" ] && spindb stop "$container_name" &>/dev/null || true
+    spindb delete "$container_name" --yes &>/dev/null || true
+    failure_reason="Seed data verification failed"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  log_step_result "ok" "$initial_count records"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 5: Backup/Restore Tests
+  # ─────────────────────────────────────────────────────────────────────────
+  # TODO: Qdrant/Meilisearch/CouchDB backup/restore in Docker E2E tests
+  # Qdrant, Meilisearch, and CouchDB use REST API for backup/restore which requires:
+  # 1. Creating snapshot/backup via REST API
+  # 2. Waiting for snapshot creation to complete
+  # 3. Downloading snapshot file
+  # 4. Restoring via snapshot recovery/import
+  # For now, skip backup/restore tests for these engines in Docker E2E.
+  # The integration tests (pnpm test:engine qdrant/meilisearch/couchdb) cover backup/restore.
+  if [ "$engine" = "qdrant" ] || [ "$engine" = "meilisearch" ] || [ "$engine" = "couchdb" ] || [ "$engine" = "libsql" ]; then
+    local format_name="snapshot"
+    [ "$engine" = "couchdb" ] && format_name="json"
+    [ "$engine" = "libsql" ] && format_name="binary"
+    log_section "Backup/Restore: $format_name format"
+    log_step "Backup/restore tests"
+    log_step_result "skip"
+    log_detail "$engine backup/restore uses REST API (tested in integration tests)"
+    test_details="smoke test (backup/restore skipped)"
+  else
+    local formats="${BACKUP_FORMATS[$engine]}"
+    local primary_format="${formats%%|*}"
+    local secondary_format="${formats#*|}"
+
+    # Format names are now semantic - no display name mapping needed
+    log_section "Backup/Restore: $primary_format format"
+    if ! test_backup_format "$engine" "$container_name" "$primary_format"; then
+    cleanup_data_lifecycle "$engine" "$container_name"
+    [ "$is_file_based" = "false" ] && spindb stop "$container_name" &>/dev/null || true
+    spindb delete "$container_name" --yes &>/dev/null || true
+    failure_reason="Backup/restore failed ($primary_format)"
+    record_result "$engine" "$version" "FAILED" "$failure_reason"
+    print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+    FAILED=$((FAILED+1))
+    return 1
+  fi
+  test_details="$primary_format"
+
+  if [ -n "$secondary_format" ] && [ "$secondary_format" != "$primary_format" ]; then
+    log_section "Backup/Restore: $secondary_format format"
+    if ! test_backup_format "$engine" "$container_name" "$secondary_format"; then
+      cleanup_data_lifecycle "$engine" "$container_name"
+      [ "$is_file_based" = "false" ] && spindb stop "$container_name" &>/dev/null || true
+      spindb delete "$container_name" --yes &>/dev/null || true
+      failure_reason="Backup/restore failed ($secondary_format)"
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    test_details="$primary_format, $secondary_format"
+  fi
+  fi # End Qdrant skip check
+
+  fi # End SMOKE_TEST != true block (Data Lifecycle + Backup/Restore)
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 6: Idempotency Tests (Server Engines Only)
+  # Skipped in smoke test mode
+  # ─────────────────────────────────────────────────────────────────────────
+  if [ "$SMOKE_TEST" != "true" ] && [ "$is_file_based" = "false" ]; then
+    log_section "Idempotency Tests"
+
+    log_step "Double-start (should warn, not error)"
+    # Container is already running - starting again should not fail
+    if spindb start "$container_name" &>/dev/null; then
+      log_step_ok
+    else
+      log_step_result "fail" "double-start errored"
+      failure_reason="Double-start caused error instead of warning"
+      cleanup_data_lifecycle "$engine" "$container_name"
+      spindb stop "$container_name" &>/dev/null || true
+      spindb delete "$container_name" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+
+    log_step "Stop container for double-stop test"
+    spindb stop "$container_name" &>/dev/null || true
+    # Wait for stop to complete
+    local wait_count=0
+    while spindb info "$container_name" --json 2>/dev/null | grep -q '"status":"running"' && [ $wait_count -lt 30 ]; do
+      sleep 1
+      wait_count=$((wait_count + 1))
+    done
+    log_step_ok
+
+    log_step "Double-stop (should warn, not error)"
+    # Container is already stopped - stopping again should not fail
+    if spindb stop "$container_name" &>/dev/null; then
+      log_step_ok
+    else
+      log_step_result "fail" "double-stop errored"
+      failure_reason="Double-stop caused error instead of warning"
+      cleanup_data_lifecycle "$engine" "$container_name"
+      spindb delete "$container_name" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 7: Rename Tests (Server Engines Only)
+  # Skipped in smoke test mode
+  # ─────────────────────────────────────────────────────────────────────────
+  if [ "$SMOKE_TEST" != "true" ] && [ "$is_file_based" = "false" ]; then
+    log_section "Rename Tests"
+
+    local renamed_container="${container_name}_renamed"
+
+    log_step "Rename stopped container"
+    if ! run_cmd spindb edit "$container_name" --name "$renamed_container"; then
+      log_step_fail
+      show_error_details
+      failure_reason="Rename failed"
+      cleanup_data_lifecycle "$engine" "$container_name"
+      spindb delete "$container_name" --yes &>/dev/null || true
+      spindb delete "$renamed_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+    CURRENT_CONTAINER="$renamed_container"  # Update for cleanup on interrupt
+
+    log_step "Start renamed container"
+    if ! spindb start "$renamed_container" &>/dev/null; then
+      log_step_fail
+      failure_reason="Start after rename failed"
+      spindb delete "$renamed_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    # Wait for container to be ready (especially important for ClickHouse)
+    local wait_count=0
+    while ! spindb info "$renamed_container" --json 2>/dev/null | grep -q '"status":"running"' && [ $wait_count -lt "$STARTUP_TIMEOUT" ]; do
+      sleep 1
+      wait_count=$((wait_count + 1))
+    done
+    # Extra wait for ClickHouse to fully initialize after showing as "running"
+    if [ "$engine" = "clickhouse" ]; then
+      sleep 3
+    fi
+    log_step_ok
+
+    log_step "Verify data persists after rename"
+    local renamed_count
+    case $engine in
+      redis|valkey)
+        renamed_count=$(get_data_count "$engine" "$renamed_container" "0")
+        ;;
+      surrealdb)
+        # SurrealDB seeds to database "test" (not "testdb")
+        renamed_count=$(get_data_count "$engine" "$renamed_container" "test")
+        ;;
+      questdb)
+        # QuestDB uses "qdb" as the default database
+        renamed_count=$(get_data_count "$engine" "$renamed_container" "qdb")
+        ;;
+      typedb)
+        # TypeDB seed file creates database "test_tdb"
+        renamed_count=$(get_data_count "$engine" "$renamed_container" "test_tdb")
+        ;;
+      *)
+        renamed_count=$(get_data_count "$engine" "$renamed_container" "testdb")
+        ;;
+    esac
+    # Debug output for empty counts
+    if [ -z "$renamed_count" ] && [ "$VERBOSE" = "true" ]; then
+      log_verbose "Empty count returned, debugging query..."
+      spindb run "$renamed_container" -c "SELECT COUNT(*) FROM test_user;" -d "testdb" 2>&1 || true
+    fi
+    renamed_count=$(echo "$renamed_count" | tr -d '[:space:]')
+    if [ "$renamed_count" != "${EXPECTED_COUNTS[$engine]}" ]; then
+      log_step_result "fail" "got $renamed_count, expected ${EXPECTED_COUNTS[$engine]}"
+      failure_reason="Data lost after rename"
+      spindb stop "$renamed_container" &>/dev/null || true
+      spindb delete "$renamed_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_result "ok" "$renamed_count records"
+
+    log_step "Verify old name doesn't exist"
+    if spindb info "$container_name" --json &>/dev/null; then
+      log_step_fail
+      failure_reason="Old container name still exists after rename"
+      spindb stop "$renamed_container" &>/dev/null || true
+      spindb delete "$renamed_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+
+    log_step "Stop renamed container"
+    spindb stop "$renamed_container" &>/dev/null || true
+    log_step_ok
+
+    # Rename back for clone test
+    log_step "Rename back for clone test"
+    if ! run_cmd spindb edit "$renamed_container" --name "$container_name"; then
+      log_step_fail
+      show_error_details
+      # Continue anyway - we'll use renamed_container for clone
+      container_name="$renamed_container"
+      # CURRENT_CONTAINER is already $renamed_container, so no update needed
+    else
+      log_step_ok
+      CURRENT_CONTAINER="$container_name"  # Update for cleanup on interrupt
+    fi
+    test_details="$test_details, rename"
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 8: Clone Tests (Server Engines Only)
+  # Skipped in smoke test mode
+  # ─────────────────────────────────────────────────────────────────────────
+  if [ "$SMOKE_TEST" != "true" ] && [ "$is_file_based" = "false" ]; then
+    log_section "Clone Tests"
+
+    local cloned_container="${container_name}_clone"
+
+    log_step "Clone stopped container"
+    if ! run_cmd spindb clone "$container_name" "$cloned_container"; then
+      log_step_fail
+      show_error_details
+      failure_reason="Clone failed"
+      spindb delete "$container_name" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+
+    log_step "Start cloned container"
+    if ! spindb start "$cloned_container" &>/dev/null; then
+      log_step_fail
+      failure_reason="Start cloned container failed"
+      spindb delete "$container_name" --yes &>/dev/null || true
+      spindb delete "$cloned_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    # Wait for container to be ready (especially important for ClickHouse)
+    local wait_count=0
+    while ! spindb info "$cloned_container" --json 2>/dev/null | grep -q '"status":"running"' && [ $wait_count -lt "$STARTUP_TIMEOUT" ]; do
+      sleep 1
+      wait_count=$((wait_count + 1))
+    done
+    # Extra wait for ClickHouse to fully initialize after showing as "running"
+    if [ "$engine" = "clickhouse" ]; then
+      sleep 3
+    fi
+    log_step_ok
+
+    log_step "Verify cloned data matches source"
+    local cloned_count
+    case $engine in
+      redis|valkey)
+        cloned_count=$(get_data_count "$engine" "$cloned_container" "0")
+        ;;
+      surrealdb)
+        # SurrealDB seeds to database "test" (not "testdb")
+        cloned_count=$(get_data_count "$engine" "$cloned_container" "test")
+        ;;
+      questdb)
+        # QuestDB uses single database 'qdb'
+        cloned_count=$(get_data_count "$engine" "$cloned_container" "qdb")
+        ;;
+      typedb)
+        # TypeDB seed file creates database "test_tdb"
+        cloned_count=$(get_data_count "$engine" "$cloned_container" "test_tdb")
+        ;;
+      *)
+        cloned_count=$(get_data_count "$engine" "$cloned_container" "testdb")
+        ;;
+    esac
+    cloned_count=$(echo "$cloned_count" | tr -d '[:space:]')
+    if [ "$cloned_count" != "${EXPECTED_COUNTS[$engine]}" ]; then
+      log_step_result "fail" "got $cloned_count, expected ${EXPECTED_COUNTS[$engine]}"
+      failure_reason="Cloned data doesn't match source"
+      spindb stop "$cloned_container" &>/dev/null || true
+      spindb delete "$container_name" --yes &>/dev/null || true
+      spindb delete "$cloned_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_result "ok" "$cloned_count records"
+
+    log_step "Verify clonedFrom metadata"
+    local cloned_from
+    cloned_from=$(spindb info "$cloned_container" --json 2>/dev/null | jq -r '.clonedFrom' 2>/dev/null)
+    if [ "$cloned_from" != "$container_name" ]; then
+      log_step_result "fail" "clonedFrom='$cloned_from', expected '$container_name'"
+      failure_reason="clonedFrom metadata incorrect"
+      spindb stop "$cloned_container" &>/dev/null || true
+      spindb delete "$container_name" --yes &>/dev/null || true
+      spindb delete "$cloned_container" --yes &>/dev/null || true
+      record_result "$engine" "$version" "FAILED" "$failure_reason"
+      print_engine_result "$engine" "$version" "FAILED" "$failure_reason"
+      FAILED=$((FAILED+1))
+      return 1
+    fi
+    log_step_ok
+
+    log_step "Stop and delete cloned container"
+    spindb stop "$cloned_container" &>/dev/null || true
+    spindb delete "$cloned_container" --yes &>/dev/null || true
+    log_step_ok
+    test_details="$test_details, clone"
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 9: Cleanup
+  # ─────────────────────────────────────────────────────────────────────────
+  # NOTE: Redis/Valkey merge vs replace mode tests are skipped here because
+  # the --flush flag is only available in the interactive menu, not via CLI.
+  # The GH Actions test-redis-modes job tests this via direct engine calls.
+  log_section "Cleanup"
+
+  # Only cleanup data lifecycle artifacts if we ran those tests
+  if [ "$SMOKE_TEST" != "true" ]; then
+    cleanup_data_lifecycle "$engine" "$container_name"
+  fi
+
+  if [ "$is_file_based" = "false" ]; then
+    log_step "Stop container"
+    spindb stop "$container_name" &>/dev/null || true
+    log_step_ok
+  fi
+
+  log_step "Delete container"
+  spindb delete "$container_name" --yes &>/dev/null || true
+  # Also cleanup any renamed/cloned containers that might be left over
+  spindb delete "${container_name}_renamed" --yes &>/dev/null || true
+  spindb delete "${container_name}_clone" --yes &>/dev/null || true
+  log_step_ok
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Success!
+  # ─────────────────────────────────────────────────────────────────────────
+  CURRENT_CONTAINER=""  # Clear tracking - container deleted
+  local result_details="$test_details"
+  if [ "$SMOKE_TEST" != "true" ]; then
+    result_details="formats: $test_details"
+  fi
+  record_result "$engine" "$version" "PASSED" "" "$result_details"
+  print_engine_result "$engine" "$version" "PASSED"
+  PASSED=$((PASSED+1))
+  return 0
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+get_default_version() {
+  spindb engines supported --json 2>/dev/null | jq -r ".engines.$1.defaultVersion" 2>/dev/null || echo ""
+}
+
+should_run_test() {
+  local engine=$1
+  # Check SKIP_ENGINES list first
+  if [ -n "$SKIP_ENGINES" ] && echo "$SKIP_ENGINES" | grep -qw "$engine"; then
+    return 1
+  fi
+  # If a specific engine filter is set, only run that engine
+  [ -n "$ENGINE_FILTER" ] && [ "$ENGINE_FILTER" = "$engine" ] && return 0
+  [ -n "$ENGINE_FILTER" ] && [ "$ENGINE_FILTER" != "$engine" ] && return 1
+  # If a group filter is set, check membership
+  if [ -n "$ENGINE_GROUP" ]; then
+    case $ENGINE_GROUP in
+      sql)   echo "$GROUP_SQL" | grep -qw "$engine" && return 0 ;;
+      nosql) echo "$GROUP_NOSQL" | grep -qw "$engine" && return 0 ;;
+      other) echo "$GROUP_OTHER" | grep -qw "$engine" && return 0 ;;
+    esac
+    return 1
+  fi
+  # No filter - run everything
+  return 0
+}
+
+# ============================================================================
+# FINAL SUMMARY
+# ============================================================================
+
+print_final_summary() {
+  echo ""
+  echo ""
+  echo "${BOLD}${CYAN}════════════════════════════════════════════════════════════════${RESET}"
+  echo "${BOLD}${CYAN}                      E2E TEST SUMMARY                          ${RESET}"
+  echo "${BOLD}${CYAN}════════════════════════════════════════════════════════════════${RESET}"
+  echo ""
+
+  # Results table
+  printf "  ${BOLD}%-12s %-10s %-8s %s${RESET}\n" "ENGINE" "VERSION" "STATUS" "DETAILS"
+  printf "  ${DIM}%-12s %-10s %-8s %s${RESET}\n" "────────────" "──────────" "────────" "─────────────────────"
+
+  for i in "${!RESULTS_ENGINE[@]}"; do
+    local engine="${RESULTS_ENGINE[$i]}"
+    local version="${RESULTS_VERSION[$i]}"
+    local status="${RESULTS_STATUS[$i]}"
+    local error="${RESULTS_ERROR[$i]}"
+    local details="${RESULTS_DETAILS[$i]}"
+
+    local status_display
+    local detail_display
+    if [ "$status" = "PASSED" ]; then
+      status_display="${GREEN}✓ PASS${RESET}"
+      detail_display="${DIM}$details${RESET}"
+    else
+      status_display="${RED}✗ FAIL${RESET}"
+      detail_display="${RED}$error${RESET}"
+    fi
+
+    printf "  %-12s %-10s %-18s %s\n" "$engine" "$version" "$status_display" "$detail_display"
+  done
+
+  echo ""
+  echo "  ${DIM}────────────────────────────────────────────────────────────${RESET}"
+
+  local total=$((PASSED + FAILED))
+  if [ $FAILED -eq 0 ]; then
+    echo ""
+    echo "  ${GREEN}${BOLD}✓ ALL $total TESTS PASSED${RESET}"
+    echo ""
+  else
+    echo ""
+    echo "  ${BOLD}Total: $total${RESET}  ${GREEN}Passed: $PASSED${RESET}  ${RED}Failed: $FAILED${RESET}"
+    echo ""
+    echo "  ${RED}${BOLD}✗ $FAILED TEST(S) FAILED${RESET}"
+    echo ""
+  fi
+
+  # Note excluded engines so the count isn't confusing
+  echo "  ${DIM}Excluded from Docker E2E: ferretdb, ferretdb-v1 (composite architecture;${RESET}"
+  echo "  ${DIM}tested via 'pnpm test:engine ferretdb[-v1]' in CI instead)${RESET}"
+  echo ""
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+# Header
+echo ""
+echo "${BOLD}${CYAN}════════════════════════════════════════════════════════════════${RESET}"
+echo "${BOLD}${CYAN}            SpinDB Docker Linux E2E Tests                       ${RESET}"
+echo "${BOLD}${CYAN}════════════════════════════════════════════════════════════════${RESET}"
+echo ""
+if [ -n "$ENGINE_FILTER" ]; then
+  echo "  ${BOLD}Filter:${RESET}    $ENGINE_FILTER"
+elif [ -n "$ENGINE_GROUP" ]; then
+  _group_engines=""
+  case $ENGINE_GROUP in
+    sql)   _group_engines="$GROUP_SQL" ;;
+    nosql) _group_engines="$GROUP_NOSQL" ;;
+    other) _group_engines="$GROUP_OTHER" ;;
+  esac
+  echo "  ${BOLD}Group:${RESET}     $ENGINE_GROUP ($_group_engines)"
+fi
+if [ "$SMOKE_TEST" = "true" ]; then
+  echo "  ${BOLD}Mode:${RESET}      ${YELLOW}smoke test${RESET} (download + start + query only)"
+else
+  echo "  ${BOLD}Mode:${RESET}      full test (all phases)"
+fi
+echo "  ${BOLD}Node:${RESET}      $(node --version 2>/dev/null || echo 'not found')"
+echo "  ${BOLD}Platform:${RESET}  $(uname -s) $(uname -m)"
+echo "  ${BOLD}SpinDB:${RESET}    $(spindb version 2>/dev/null || echo 'not installed')"
+
+# Check required tools
+log_section "Checking Required Tools"
+# curl is required for Qdrant REST API tests
+REQUIRED_TOOLS="jq node pnpm spindb curl"
+for tool in $REQUIRED_TOOLS; do
+  log_step "Check $tool"
+  if command -v "$tool" &>/dev/null; then
+    log_step_ok
+  else
+    log_step_fail
+    log_error "$tool is required but not installed"
+    exit 1
+  fi
+done
+
+# Clean state
+log_section "Preparing Test Environment"
+if [ -n "$CI" ]; then
+  # In CI, safe to delete real home data
+  log_step "Clear ~/.spindb (CI mode)"
+  rm -rf ~/.spindb 2>/dev/null || true
+  log_step_ok
+else
+  # Outside CI, use a temporary directory to avoid deleting real user data
+  log_step "Create isolated SPINDB_HOME"
+  CREATED_TEMP_SPINDB_HOME=$(mktemp -d)
+  export SPINDB_HOME="$CREATED_TEMP_SPINDB_HOME"
+  log_step_result "ok" "$SPINDB_HOME"
+  log_warning "Running outside CI - using temp directory instead of ~/.spindb"
+fi
+
+# Check libraries
+log_step "Check system libraries"
+missing_libs=0
+
+# Function to check if a library exists via file scan
+check_lib_exists() {
+  local lib="$1"
+  local lib_dirs="/lib /lib64 /usr/lib /usr/lib64 /usr/local/lib"
+  # Add architecture-specific directories (glibc and musl variants)
+  for base in /lib /usr/lib; do
+    for variant in "$base"/*-linux-gnu* "$base"/*-linux-musl*; do
+      [ -d "$variant" ] && lib_dirs="$lib_dirs $variant"
+    done
+  done
+  # Search for library files (e.g., libaio.so, libaio.so.1, libaio.a)
+  for dir in $lib_dirs; do
+    if [ -d "$dir" ] && ls "$dir"/${lib}.* "$dir"/${lib}-*.* 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+for lib in libaio libnuma libncurses libssl; do
+  if command -v ldconfig >/dev/null 2>&1; then
+    # Use ldconfig if available (faster, more accurate)
+    ldconfig -p 2>/dev/null | grep -q "$lib" || missing_libs=$((missing_libs+1))
+  else
+    # Fallback to file scan for systems without ldconfig (Alpine, minimal containers)
+    check_lib_exists "$lib" || missing_libs=$((missing_libs+1))
+  fi
+done
+if [ $missing_libs -eq 0 ]; then
+  log_step_ok
+else
+  log_step_result "ok" "$missing_libs optional libs missing"
+fi
+
+# Run engine tests
+# Note: ferretdb is skipped in Docker E2E due to timeout/signal handling issues with its
+# composite architecture (PostgreSQL backend + FerretDB proxy). The FerretDB integration
+# tests (pnpm test:engine ferretdb) run on GitHub Actions macOS/Linux and provide coverage.
+# Note: TigerBeetle requires io_uring syscalls. Docker must be run with
+# --security-opt seccomp=unconfined (handled by run-docker-test.sh).
+for engine in postgresql mysql mariadb sqlite mongodb redis valkey clickhouse duckdb qdrant meilisearch couchdb cockroachdb surrealdb questdb typedb influxdb weaviate tigerbeetle libsql; do
+  if should_run_test "$engine"; then
+    version=$(get_default_version "$engine")
+    if [ -n "$version" ]; then
+      run_test "$engine" "$version"
+    else
+      log_header "$engine"
+      echo "  ${YELLOW}Skipped: no default version configured${RESET}"
+    fi
+  fi
+done
+
+# Run utility tests (non-engine tests)
+# Self-update test is skipped in smoke test mode
+if [ "$SMOKE_TEST" != "true" ] && should_run_test "self-update"; then
+  run_self_update_test
+fi
+
+# Summary
+print_final_summary
+
+# Exit code
+[ $FAILED -gt 0 ] && exit 1
+exit 0
