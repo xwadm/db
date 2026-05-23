@@ -1,124 +1,126 @@
 /**
- * TigerBeetle 版本验证器
- *
- * 提供版本解析、验证和比较工具函数。
+ * TigerBeetle 版本验证工具
+ * 处理版本解析、比较和兼容性检查
  */
 
-import {
-  TIGERBEETLE_VERSION_MAP,
-  SUPPORTED_MAJOR_VERSIONS,
-} from './version-maps'
-
-export type ParsedVersion = {
+/**
+ * 将 TigerBeetle 版本字符串解析为各个组成部分
+ * 支持 "0.16.70"、"0.16"、"v0.16.70" 等格式
+ */
+export function parseVersion(versionString: string): {
   major: number
   minor: number
   patch: number
-  full: string
+  raw: string
+} | null {
+  const cleaned = versionString.replace(/^v/, '').trim()
+  if (!cleaned) return null
+
+  const parts = cleaned.split('.')
+
+  const major = parseInt(parts[0], 10)
+  const minor = parts[1] ? parseInt(parts[1], 10) : 0
+  const patch = parts[2] ? parseInt(parts[2], 10) : 0
+
+  if (isNaN(major)) return null
+  if (parts[1] && isNaN(minor)) return null
+  if (parts[2] && isNaN(patch)) return null
+
+  return { major, minor, patch, raw: cleaned }
 }
 
 /**
- * 将版本字符串解析为各组成部分
- * @param version 版本字符串（例如 '0.16.70'、'0.16'、'0'）
- * @returns 解析后的版本，无效则返回 null
- */
-export function parseVersion(version: string): ParsedVersion | null {
-  // 匹配版本模式：0.16.70、0.16、0
-  const match = version.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?$/)
-  if (!match) return null
-
-  const major = parseInt(match[1], 10)
-  const minor = match[2] ? parseInt(match[2], 10) : 0
-  const patch = match[3] ? parseInt(match[3], 10) : 0
-
-  return {
-    major,
-    minor,
-    patch,
-    full: `${major}.${minor}.${patch}`,
-  }
-}
-
-/**
- * 检查版本是否受支持
+ * 检查 TigerBeetle 版本是否受 SpinDB 支持
+ * 最低支持版本：0.16.0
  */
 export function isVersionSupported(version: string): boolean {
   const parsed = parseVersion(version)
   if (!parsed) return false
 
-  const majorStr = String(parsed.major)
-  return SUPPORTED_MAJOR_VERSIONS.includes(majorStr)
+  // 支持 0.16 及以上版本
+  if (parsed.major === 0) {
+    return parsed.minor >= 16
+  }
+  return parsed.major >= 1
 }
 
 /**
- * 从版本字符串获取主要版本号
+ * 从完整版本字符串中获取主版本号（两段式 xy 格式）
+ * 例如 "0.16.70" -> "0.16"
  */
-export function getMajorVersion(version: string): string | null {
+export function getMajorVersion(version: string): string {
   const parsed = parseVersion(version)
-  if (!parsed) return null
-  return String(parsed.major)
+  if (!parsed) return version
+  return `${parsed.major}.${parsed.minor}`
 }
 
 /**
- * 比较两个版本
- * @returns -1 表示 a < b，0 表示 a == b，1 表示 a > b
+ * 从完整版本字符串中获取主版本号.次版本号。
+ * 这是 getMajorVersion 的有意别名——两者都返回两段式 xy 格式
+ * 版本（例如 "0.16"）。作为独立导出保留，以保持与其他引擎
+ * 版本验证器的 API 一致性。
  */
-export function compareVersions(a: string, b: string): number {
+export function getMajorMinorVersion(version: string): string {
+  return getMajorVersion(version)
+}
+
+/**
+ * 比较两个 TigerBeetle 版本
+ * 返回值：若 a < b 则返回 -1，若 a == b 则返回 0，若 a > b 则返回 1，若任一版本无法解析则返回 null
+ */
+export function compareVersions(a: string, b: string): number | null {
   const parsedA = parseVersion(a)
   const parsedB = parseVersion(b)
 
   if (!parsedA || !parsedB) {
-    // 解析失败时回退到字符串比较
-    return a.localeCompare(b)
+    return null
   }
 
   if (parsedA.major !== parsedB.major) {
-    return parsedA.major - parsedB.major
+    return parsedA.major < parsedB.major ? -1 : 1
   }
   if (parsedA.minor !== parsedB.minor) {
-    return parsedA.minor - parsedB.minor
+    return parsedA.minor < parsedB.minor ? -1 : 1
   }
-  return parsedA.patch - parsedB.patch
+  if (parsedA.patch !== parsedB.patch) {
+    return parsedA.patch < parsedB.patch ? -1 : 1
+  }
+  return 0
 }
 
 /**
- * 检查两个版本是否兼容（用于备份/恢复）
- * TigerBeetle 允许恢复到相同或更新的次要版本
+ * 检查备份版本与恢复版本是否兼容
+ * TigerBeetle 数据文件在次版本内通常兼容
  */
 export function isVersionCompatible(
-  sourceVersion: string,
-  targetVersion: string,
-): boolean {
-  const source = parseVersion(sourceVersion)
-  const target = parseVersion(targetVersion)
+  backupVersion: string,
+  restoreVersion: string,
+): { compatible: boolean; warning?: string } {
+  const backup = parseVersion(backupVersion)
+  const restore = parseVersion(restoreVersion)
 
-  if (!source || !target) return false
+  if (!backup || !restore) {
+    return {
+      compatible: true,
+      warning: '无法解析版本信息，将继续进行恢复',
+    }
+  }
 
-  // 主要版本必须匹配
-  if (source.major !== target.major) return false
+  // TigerBeetle 要求主版本号.次版本号必须完全一致
+  if (backup.major !== restore.major || backup.minor !== restore.minor) {
+    return {
+      compatible: false,
+      warning: `无法将 TigerBeetle ${backupVersion} 数据恢复到 ${restoreVersion} 服务器。主版本号和次版本号必须一致。`,
+    }
+  }
 
-  // 目标版本必须 >= 源版本
-  return compareVersions(targetVersion, sourceVersion) >= 0
+  return { compatible: true }
 }
 
 /**
- * 将版本别名解析为完整版本
+ * 验证版本字符串是否符合支持的格式
  */
-export function resolveVersion(version: string): string {
-  // 检查是否已在映射中
-  if (TIGERBEETLE_VERSION_MAP[version]) {
-    return TIGERBEETLE_VERSION_MAP[version]
-  }
-
-  // 如果已是完整版本格式，直接返回
-  if (/^\d+\.\d+\.\d+$/.test(version)) {
-    return version
-  }
-
-  // 尝试主要版本查找
-  const majorVersion = getMajorVersion(version)
-  if (majorVersion && TIGERBEETLE_VERSION_MAP[majorVersion]) {
-    return TIGERBEETLE_VERSION_MAP[majorVersion]
-  }
-
-  return version
+export function isValidVersionFormat(version: string): boolean {
+  const parsed = parseVersion(version)
+  return parsed !== null
 }

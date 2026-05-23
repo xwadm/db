@@ -98,11 +98,7 @@ describe('remote-container', () => {
       const result = parseConnectionString(
         'postgresql://user:pass@host.com/db?sslmode=require&connect_timeout=10',
       )
-      assertEqual(
-        result.params.sslmode,
-        'require',
-        'sslmode 参数应存在',
-      )
+      assertEqual(result.params.sslmode, 'require', 'sslmode 参数应存在')
       assertEqual(
         result.params.connect_timeout,
         '10',
@@ -262,10 +258,7 @@ describe('remote-container', () => {
     })
 
     it('应该对 localhost 返回 null', () => {
-      assertNullish(
-        detectProvider('localhost'),
-        '对 localhost 应返回 null',
-      )
+      assertNullish(detectProvider('localhost'), '对 localhost 应返回 null')
     })
   })
 
@@ -287,10 +280,7 @@ describe('remote-container', () => {
     })
 
     it('应该不检测到远程主机', () => {
-      assert(
-        !isLocalhost('db.neon.tech'),
-        'db.neon.tech 不应为 localhost',
-      )
+      assert(!isLocalhost('db.neon.tech'), 'db.neon.tech 不应为 localhost')
       assert(!isLocalhost('192.168.1.1'), '192.168.1.1 不应为 localhost')
     })
   })
@@ -331,11 +321,7 @@ describe('remote-container', () => {
         host: 'custom-server.example.com',
         database: '',
       })
-      assertEqual(
-        name,
-        'remote-custom-server',
-        '应使用 host 前缀回退',
-      )
+      assertEqual(name, 'remote-custom-server', '应使用 host 前缀回退')
     })
 
     it('应该清理特殊字符', () => {
@@ -345,10 +331,7 @@ describe('remote-container', () => {
         database: 'my.special@db',
         provider: null,
       })
-      assert(
-        /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(name),
-        `名称 "${name}" 应被清理`,
-      )
+      assert(/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(name), `名称 "${name}" 应被清理`)
     })
   })
 
@@ -357,24 +340,15 @@ describe('remote-container', () => {
       const result = redactConnectionString(
         'postgresql://user:mysecretpass@host.com/db',
       )
-      assert(
-        result.includes(':***@'),
-        '应包含密码脱敏标记',
-      )
-      assert(
-        !result.includes('mysecretpass'),
-        '不应包含原始密码',
-      )
+      assert(result.includes(':***@'), '应包含密码脱敏标记')
+      assert(!result.includes('mysecretpass'), '不应包含原始密码')
     })
 
     it('应该处理 URL 编码的密码', () => {
       const result = redactConnectionString(
         'postgresql://user:p%40ss%23word@host.com/db',
       )
-      assert(
-        !result.includes('p%40ss%23word'),
-        '不应包含编码后的密码',
-      )
+      assert(!result.includes('p%40ss%23word'), '不应包含编码后的密码')
       assert(result.includes(':***@'), '应包含脱敏标记')
     })
 
@@ -387,11 +361,7 @@ describe('remote-container', () => {
     it('应该处理空密码', () => {
       const url = 'postgresql://user:@host.com/db'
       const result = redactConnectionString(url)
-      assertEqual(
-        result,
-        url,
-        '对空密码应返回未修改的 URL',
-      )
+      assertEqual(result, url, '对空密码应返回未修改的 URL')
     })
   })
 
@@ -406,10 +376,7 @@ describe('remote-container', () => {
       assertEqual(config.origin, 'external', 'origin 应默认为 external')
       assertEqual(config.ssl, true, '远程主机的 SSL 应为 true')
       assertEqual(config.provider, 'neon', 'provider 应为 neon')
-      assert(
-        !config.connectionString.includes('pass'),
-        '连接字符串应被脱敏',
-      )
+      assert(!config.connectionString.includes('pass'), '连接字符串应被脱敏')
     })
 
     it('应该将 layerbase 链接标记为 cloud origin', () => {
@@ -475,11 +442,7 @@ describe('remote-container', () => {
     })
 
     it('应该为 MySQL 返回 3306', () => {
-      assertEqual(
-        getDefaultPortForEngine(Engine.MySQL),
-        3306,
-        'MySQL 默认端口',
-      )
+      assertEqual(getDefaultPortForEngine(Engine.MySQL), 3306, 'MySQL 默认端口')
     })
 
     it('应该为 MongoDB 返回 27017', () => {
@@ -491,11 +454,7 @@ describe('remote-container', () => {
     })
 
     it('应该为 Redis 返回 6379', () => {
-      assertEqual(
-        getDefaultPortForEngine(Engine.Redis),
-        6379,
-        'Redis 默认端口',
-      )
+      assertEqual(getDefaultPortForEngine(Engine.Redis), 6379, 'Redis 默认端口')
     })
 
     it('应该为 Valkey 返回 6379', () => {
@@ -558,11 +517,7 @@ describe('remote-container', () => {
       const result = parseConnectionString(
         'postgresql://user:pass@host.com/my%2Fdb',
       )
-      assertEqual(
-        result.database,
-        'my/db',
-        '包含斜杠的数据库名应被解码',
-      )
+      assertEqual(result.database, 'my/db', '包含斜杠的数据库名应被解码')
     })
 
     it('应该处理没有端口的 mongodb+srv', () => {
@@ -585,20 +540,14 @@ describe('remote-container', () => {
     it('应该脱敏包含正则表达式特殊字符的 URL 编码密码', () => {
       const url = 'postgresql://user:a%2Bb%24c%5Ed@host.com/db'
       const result = redactConnectionString(url)
-      assert(
-        !result.includes('a%2Bb%24c%5Ed'),
-        '不应包含编码后的密码',
-      )
+      assert(!result.includes('a%2Bb%24c%5Ed'), '不应包含编码后的密码')
       assert(result.includes(':***@'), '应包含脱敏标记')
     })
 
     it('应该处理包含 @ 符号的密码', () => {
       const url = 'postgresql://user:p%40ssword@host.com/db'
       const result = redactConnectionString(url)
-      assert(
-        !result.includes('p%40ssword'),
-        '不应包含编码后的密码',
-      )
+      assert(!result.includes('p%40ssword'), '不应包含编码后的密码')
       assert(result.includes(':***@'), '应包含脱敏标记')
     })
 
@@ -630,10 +579,7 @@ describe('remote-container', () => {
         database: '12345',
         provider: null,
       })
-      assert(
-        /^[a-zA-Z]/.test(name),
-        `名称 "${name}" 应以字母开头`,
-      )
+      assert(/^[a-zA-Z]/.test(name), `名称 "${name}" 应以字母开头`)
     })
 
     it('应该处理空主机和数据库', () => {
@@ -644,10 +590,7 @@ describe('remote-container', () => {
         provider: null,
       })
       assert(name.length > 0, '应返回非空名称')
-      assert(
-        /^[a-zA-Z]/.test(name),
-        `名称 "${name}" 应以字母开头`,
-      )
+      assert(/^[a-zA-Z]/.test(name), `名称 "${name}" 应以字母开头`)
     })
   })
 

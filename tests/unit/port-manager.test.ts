@@ -1,153 +1,236 @@
-/**
- * 端口管理器测试
- */
-
 import { describe, it } from 'node:test'
+import { PortManager } from '../../core/port-manager'
 import { assert, assertEqual } from '../utils/assertions'
-import {
-  findAvailablePort,
-  isPortAvailable,
-  isPortInRange,
-  getDefaultPortRange,
-  validatePort,
-} from '../../core/port-manager'
 
-describe('Port Manager', () => {
-  describe('validatePort', () => {
-    it('应接受有效的 port 号码', () => {
-      assertEqual(validatePort(5432), 5432, '应接受 5432')
-      assertEqual(validatePort(1), 1, '应接受 1')
-      assertEqual(validatePort(65535), 65535, '应接受 65535')
-    })
-
-    it('应拒绝 port 0', () => {
-      try {
-        validatePort(0)
-        assert(false, '应该抛出异常')
-      } catch (error) {
-        assert(error instanceof Error, '应抛出 Error')
-      }
-    })
-
-    it('应拒绝负数 port', () => {
-      try {
-        validatePort(-1)
-        assert(false, '应该抛出异常')
-      } catch (error) {
-        assert(error instanceof Error, '应抛出 Error')
-      }
-    })
-
-    it('应拒绝超过 65535 的 port', () => {
-      try {
-        validatePort(65536)
-        assert(false, '应该抛出异常')
-      } catch (error) {
-        assert(error instanceof Error, '应抛出 Error')
-      }
-    })
-
-    it('应拒绝非整数 port', () => {
-      try {
-        validatePort(5432.5)
-        assert(false, '应该抛出异常')
-      } catch (error) {
-        assert(error instanceof Error, '应抛出 Error')
-      }
-    })
-  })
-
-  describe('isPortInRange', () => {
-    it('应为默认 range 内的 port 返回 true', () => {
-      const range = getDefaultPortRange()
-
-      assert(
-        isPortInRange(range.start, range),
-        '起始 port 应在 range 内',
-      )
-      assert(isPortInRange(range.end, range), '结束 port 应在 range 内')
-      assert(
-        isPortInRange(Math.floor((range.start + range.end) / 2), range),
-        '中间 port 应在 range 内',
-      )
-    })
-
-    it('应为 range 外的 port 返回 false', () => {
-      const range = getDefaultPortRange()
-
-      assert(
-        !isPortInRange(range.start - 1, range),
-        '低于起始值的 port 应在 range 外',
-      )
-      assert(
-        !isPortInRange(range.end + 1, range),
-        '高于结束值的 port 应在 range 外',
-      )
-    })
-  })
-
+describe('端口管理器', () => {
   describe('isPortAvailable', () => {
-    it('应为可用 port 返回 true', async () => {
-      // Port 0 是一个特殊情况 - 它让操作系统分配一个 port
-      // 对于测试，我们检查一个可能可用的高 port
-      const available = await isPortAvailable(49152)
-
-      // 这个测试在 CI 环境中可能不稳定，因为很多 port 都在使用中
-      // 我们只验证函数返回 boolean
-      assert(
-        typeof available === 'boolean',
-        '应返回 boolean',
-      )
+    it('应对可用端口返回 true', async () => {
+      const portManager = new PortManager()
+      // 端口 59999 不太可能被占用
+      const available = await portManager.isPortAvailable(59999)
+      assert(typeof available === 'boolean', '应返回布尔值')
     })
 
-    it('应为 port 0 返回 false', async () => {
-      const available = await isPortAvailable(0)
-      assertEqual(available, false, 'Port 0 应该是不可用的')
+    it('应对特权端口 1 返回 false（通常不可用）', async () => {
+      const portManager = new PortManager()
+      // 端口 1 需要 root 权限，应该会失败
+      const available = await portManager.isPortAvailable(1)
+      // 在大多数系统上，非 root 用户无法绑定端口 1
+      // 但错误处理会将非 EADDRINUSE 的情况视为可用
+      assert(typeof available === 'boolean', '应返回布尔值')
     })
   })
 
   describe('findAvailablePort', () => {
-    it('应在 range 内找到可用 port', async () => {
-      const range = getDefaultPortRange()
-      const port = await findAvailablePort(range)
+    it('应返回带有 isDefault 属性的端口', async () => {
+      const portManager = new PortManager()
+      const result = await portManager.findAvailablePort({
+        preferredPort: 59990,
+        portRange: { start: 59990, end: 59999 },
+      })
 
-      assert(
-        port !== null,
-        '应找到可用 port',
-      )
-      assert(
-        isPortInRange(port, range),
-        `Port ${port} 应在 range 内`,
-      )
+      assert(typeof result.port === 'number', '应返回端口号')
+      assert(typeof result.isDefault === 'boolean', '应返回 isDefault 标志')
+      assert(result.port >= 59990, '端口应在范围内')
+      assert(result.port <= 59999, '端口应在范围内')
     })
 
-    it('当没有可用 port 时应返回 null', async () => {
-      // 创建一个只有一个 port 的很小的 range
-      // 如果那个 port 被占用，findAvailablePort 应该返回 null
-      const tinyRange = { start: 1, end: 1 }
-      const port = await findAvailablePort(tinyRange)
+    it('当范围内没有可用端口时应抛出错误', async () => {
+      const portManager = new PortManager()
+      // 创建一个始终返回 false 的模拟（所有端口均被占用）
+      const originalIsPortAvailable =
+        portManager.isPortAvailable.bind(portManager)
+      portManager.isPortAvailable = async () => {
+        return false
+      }
 
-      // Port 1 可能被系统服务占用
-      // 所以我们期望返回 null，但测试主要是检查函数不会抛出异常
+      try {
+        await portManager.findAvailablePort({
+          preferredPort: 59990,
+          portRange: { start: 59990, end: 59992 },
+        })
+        assert(false, '应该已抛出错误')
+      } catch (error) {
+        assert(error instanceof Error, '应抛出 Error')
+        assert(
+          error.message.includes('没有可用端口'),
+          `错误消息应提及没有可用端口：${error.message}`,
+        )
+        assert(
+          error.message.includes('59990-59992'),
+          `错误消息应包含端口范围：${error.message}`,
+        )
+      } finally {
+        portManager.isPortAvailable = originalIsPortAvailable
+      }
+    })
+
+    it('如果首选端口已被尝试过，应跳过它', async () => {
+      const portManager = new PortManager()
+      const triedPorts: number[] = []
+      const originalIsPortAvailable =
+        portManager.isPortAvailable.bind(portManager)
+
+      portManager.isPortAvailable = async (port: number) => {
+        triedPorts.push(port)
+        // 第一次调用（首选端口）返回 false，之后返回 true
+        return port !== 59990
+      }
+
+      try {
+        const result = await portManager.findAvailablePort({
+          preferredPort: 59990,
+          portRange: { start: 59990, end: 59995 },
+        })
+
+        assert(result.port !== 59990, '不应返回不可用的首选端口')
+        assert(result.isDefault === false, '不应标记为默认端口')
+        // 应先尝试首选端口一次，然后扫描范围（跳过已尝试的首选端口）
+        assertEqual(triedPorts[0], 59990, '应首先尝试首选端口')
+        assert(!triedPorts.slice(1).includes(59990), '不应在扫描中重试首选端口')
+      } finally {
+        portManager.isPortAvailable = originalIsPortAvailable
+      }
+    })
+  })
+
+  describe('getPortUser', () => {
+    it('应对未使用的端口返回 null', async () => {
+      const portManager = new PortManager()
+      // 端口 59998 不太可能被占用
+      const user = await portManager.getPortUser(59998)
+      // 如果没有程序使用它，lsof 不会返回任何内容
+      assert(user === null || typeof user === 'string', '应返回 null 或字符串')
+    })
+
+    it('应优雅地处理 lsof 错误', async () => {
+      const portManager = new PortManager()
+      // 无效端口不应导致崩溃
+      const user = await portManager.getPortUser(-1)
+      // 根据 lsof 的行为，可能返回 null 或空字符串
       assert(
-        port === null || port === 1,
-        '应返回 null 或唯一的 port',
+        user === null || user === '',
+        `对于无效端口应返回 null 或空字符串，实际得到："${user}"`,
       )
     })
   })
 
-  describe('getDefaultPortRange', () => {
-    it('应返回有效的 port range', () => {
-      const range = getDefaultPortRange()
+  describe('getContainerPorts', () => {
+    it('应返回端口数组', async () => {
+      const portManager = new PortManager()
+      const ports = await portManager.getContainerPorts()
 
-      assert(
-        typeof range.start === 'number',
-        'Start 应该是 number',
-      )
-      assert(typeof range.end === 'number', 'End 应该是 number')
-      assert(range.start > 0, 'Start 应该是正数')
-      assert(range.end <= 65535, 'End 应该 <= 65535')
-      assert(range.start < range.end, 'Start 应该小于 End')
+      assert(Array.isArray(ports), '应返回一个数组')
+      for (const port of ports) {
+        assert(typeof port === 'number', '每个端口都应为数字')
+        // 对于基于文件的数据库（如 SQLite），端口 0 是有效的（无服务器）
+        assert(port >= 0, '端口应为非负数')
+      }
     })
+
+    it('如果 containers 目录不存在，应返回空数组', async () => {
+      // 此测试检查开头的 existsSync 检查
+      const portManager = new PortManager()
+      const ports = await portManager.getContainerPorts()
+      assert(Array.isArray(ports), '即使为空也应返回一个数组')
+    })
+  })
+
+  describe('findAvailablePortExcludingContainers', () => {
+    it('应跳过已被容器使用的端口', async () => {
+      const portManager = new PortManager()
+      const originalGetContainerPorts =
+        portManager.getContainerPorts.bind(portManager)
+      const originalIsPortAvailable =
+        portManager.isPortAvailable.bind(portManager)
+
+      // 模拟容器端口
+      portManager.getContainerPorts = async () => [59990, 59991]
+
+      const triedPorts: number[] = []
+      portManager.isPortAvailable = async (port: number) => {
+        triedPorts.push(port)
+        return true
+      }
+
+      try {
+        const result = await portManager.findAvailablePortExcludingContainers({
+          preferredPort: 59990,
+          portRange: { start: 59990, end: 59995 },
+        })
+
+        // 应跳过 59990 和 59991（已被容器使用）
+        assert(
+          result.port !== 59990 && result.port !== 59991,
+          '不应返回已被容器使用的端口',
+        )
+        assert(
+          !triedPorts.includes(59990) || triedPorts.indexOf(59990) === 0,
+          '应首先检查首选端口',
+        )
+      } finally {
+        portManager.getContainerPorts = originalGetContainerPorts
+        portManager.isPortAvailable = originalIsPortAvailable
+      }
+    })
+
+    it('当范围内所有端口均被占用时应抛出错误', async () => {
+      const portManager = new PortManager()
+      const originalGetContainerPorts =
+        portManager.getContainerPorts.bind(portManager)
+      const originalIsPortAvailable =
+        portManager.isPortAvailable.bind(portManager)
+
+      // 所有端口均被容器占用
+      portManager.getContainerPorts = async () => [59990, 59991, 59992]
+      portManager.isPortAvailable = async () => true // 原本可用，但被容器阻止
+
+      try {
+        await portManager.findAvailablePortExcludingContainers({
+          preferredPort: 59990,
+          portRange: { start: 59990, end: 59992 },
+        })
+        assert(false, '应该已抛出错误')
+      } catch (error) {
+        assert(error instanceof Error, '应抛出 Error')
+        assert(
+          error.message.includes('没有可用端口'),
+          `错误应提及没有可用端口：${error.message}`,
+        )
+      } finally {
+        portManager.getContainerPorts = originalGetContainerPorts
+        portManager.isPortAvailable = originalIsPortAvailable
+      }
+    })
+  })
+})
+
+describe('端口错误消息', () => {
+  it('应提供包含端口范围的可操作错误消息', async () => {
+    const portManager = new PortManager()
+    const originalIsPortAvailable =
+      portManager.isPortAvailable.bind(portManager)
+    portManager.isPortAvailable = async () => false
+
+    let threw = false
+    let caughtError: Error | null = null
+
+    try {
+      await portManager.findAvailablePort({
+        portRange: { start: 5432, end: 5440 },
+      })
+    } catch (error) {
+      threw = true
+      caughtError = error as Error
+    } finally {
+      portManager.isPortAvailable = originalIsPortAvailable
+    }
+
+    assert(threw, '当没有可用端口时，findAvailablePort 应抛出错误')
+    assert(caughtError instanceof Error, '应抛出 Error')
+    assert(
+      caughtError!.message.includes('5432-5440'),
+      '错误应包含所尝试的具体端口范围',
+    )
   })
 })

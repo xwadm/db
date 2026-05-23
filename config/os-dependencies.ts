@@ -1,7 +1,7 @@
 /**
  * 数据库引擎的操作系统级依赖注册表
  *
- * 此模块定义了每个数据库引擎在不同操作系统和包管理器下所需的系统包。
+ * 本模块定义了每个数据库引擎在不同操作系统和包管理器下所需的系统软件包。
  */
 
 import { getPostgresHomebrewPackage } from './engine-defaults'
@@ -18,9 +18,9 @@ export type PackageManagerId =
 
 export type Platform = 'darwin' | 'linux' | 'win32'
 
-// 特定包管理器的包定义
+// 特定包管理器的软件包定义
 export type PackageDefinition = {
-  // 要安装的包名
+  // 要安装的软件包名称
   package: string
   // 可选的安装后命令（例如 brew link）
   postInstall?: string[]
@@ -32,11 +32,11 @@ export type PackageDefinition = {
 export type Dependency = {
   // 人类可读的名称
   name: string
-  // 要在 PATH 中检查的二进制名称
+  // 要在 PATH 中检查的二进制文件名称
   binary: string
-  // 该工具的功能描述
+  // 描述该工具的功能
   description: string
-  // 各包管理器对应的包定义
+  // 每种包管理器的软件包定义
   packages: Partial<Record<PackageManagerId, PackageDefinition>>
   // 当没有可用的包管理器时的替代安装说明
   manualInstall: Partial<Record<Platform, string[]>>
@@ -138,7 +138,7 @@ export const packageManagers: PackageManagerConfig[] = [
 ]
 
 // =============================================================================
-// PostgreSQL 依赖
+// PostgreSQL 依赖项
 // =============================================================================
 
 /**
@@ -172,7 +172,7 @@ function createPostgresDependency(
       darwin: [
         '安装 Homebrew：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
         `然后运行：brew install ${pgPackage} && brew link --overwrite ${pgPackage}`,
-        '或者安装 Postgres.app：https://postgresapp.com/downloads.html',
+        '或安装 Postgres.app：https://postgresapp.com/downloads.html',
       ],
       linux: [
         'Ubuntu/Debian：sudo apt install postgresql-client',
@@ -204,13 +204,13 @@ const postgresqlDependencies: EngineDependencies = {
     createPostgresDependency(
       'pg_basebackup',
       'pg_basebackup',
-      '用于物理备份的 PostgreSQL 基础备份工具',
+      'PostgreSQL 基础备份工具，用于物理备份',
     ),
   ],
 }
 
 // =============================================================================
-// MySQL 依赖（未来可扩充）
+// MySQL 依赖项（为将来预留）
 // =============================================================================
 
 const mysqlDependencies: EngineDependencies = {
@@ -354,7 +354,7 @@ const mysqlDependencies: EngineDependencies = {
 }
 
 // =============================================================================
-// SQLite 依赖
+// SQLite 依赖项
 // =============================================================================
 
 const sqliteDependencies: EngineDependencies = {
@@ -379,7 +379,7 @@ const sqliteDependencies: EngineDependencies = {
         darwin: [
           '安装 Homebrew：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
           '然后运行：brew install sqlite',
-          '注意：macOS 默认在 /usr/bin/sqlite3 中包含了 sqlite3',
+          '注意：macOS 默认在 /usr/bin/sqlite3 中包含 sqlite3',
         ],
         linux: [
           'Debian/Ubuntu：sudo apt install sqlite3',
@@ -399,7 +399,7 @@ const sqliteDependencies: EngineDependencies = {
 }
 
 // =============================================================================
-// MongoDB 依赖
+// MongoDB 依赖项
 // =============================================================================
 
 const mongodbDependencies: EngineDependencies = {
@@ -415,7 +415,7 @@ const mongodbDependencies: EngineDependencies = {
           package: 'mongodb/brew/mongodb-community',
           preInstall: ['brew tap mongodb/brew'],
         },
-        // MongoDB 需要其自身的 apt 仓库，不在默认仓库中
+        // MongoDB 需要其自身的 apt 仓库，默认仓库中不可用
         choco: { package: 'mongodb' },
         winget: { package: 'MongoDB.Server' },
         scoop: { package: 'mongodb' },
@@ -425,7 +425,7 @@ const mongodbDependencies: EngineDependencies = {
           '安装 Homebrew：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
           '添加 MongoDB tap：brew tap mongodb/brew',
           '然后运行：brew install mongodb-community',
-          '对于特定版本：brew install mongodb-community@7.0',
+          '安装特定版本：brew install mongodb-community@7.0',
         ],
         linux: [
           'MongoDB 需要添加其官方仓库。',
@@ -442,7 +442,7 @@ const mongodbDependencies: EngineDependencies = {
     {
       name: 'mongosh',
       binary: 'mongosh',
-      description: 'MongoDB Shell（现代交互式 shell）',
+      description: 'MongoDB Shell（现代交互式 Shell）',
       packages: {
         brew: { package: 'mongosh' },
         choco: { package: 'mongodb-shell' },
@@ -515,7 +515,7 @@ const mongodbDependencies: EngineDependencies = {
 }
 
 // =============================================================================
-// Redis 依赖
+// Redis 依赖项
 // =============================================================================
 
 const redisDependencies: EngineDependencies = {
@@ -538,7 +538,7 @@ const redisDependencies: EngineDependencies = {
         darwin: [
           '安装 Homebrew：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
           '然后运行：brew install redis',
-          '若要作为服务启动：brew services start redis',
+          '作为服务启动：brew services start redis',
         ],
         linux: [
           'Debian/Ubuntu：sudo apt install redis-server',
@@ -585,7 +585,7 @@ const redisDependencies: EngineDependencies = {
 }
 
 // =============================================================================
-// Valkey 依赖
+// Valkey 依赖项
 // =============================================================================
 
 const valkeyDependencies: EngineDependencies = {
@@ -597,8 +597,8 @@ const valkeyDependencies: EngineDependencies = {
       binary: 'valkey-server',
       description: 'Valkey 内存数据存储服务器（Redis 分支）',
       packages: {
-        // Valkey 相对较新 — 尚未被大多数包管理器收录
-        // 主要分发方式是通过 GitHub 发布（hostdb）
+        // Valkey 较新 — 尚未被大多数包管理器收录
+        // 主要分发渠道是 GitHub releases（hostdb）
         brew: { package: 'valkey' },
       },
       manualInstall: {
@@ -646,7 +646,7 @@ const valkeyDependencies: EngineDependencies = {
 }
 
 // =============================================================================
-// ClickHouse 依赖
+// ClickHouse 依赖项
 // =============================================================================
 
 const clickhouseDependencies: EngineDependencies = {
@@ -657,7 +657,7 @@ const clickhouseDependencies: EngineDependencies = {
       name: 'clickhouse',
       binary: 'clickhouse',
       description:
-        'ClickHouse 数据库二进制文件（clickhouse-server、clickhouse-client、clickhouse-local、clickhouse-benchmark）。Homebrew 安装统一的 clickhouse 二进制文件及其子命令。',
+        'ClickHouse 数据库二进制文件（clickhouse-server、clickhouse-client、clickhouse-local、clickhouse-benchmark）。Homebrew 安装统一的 clickhouse 二进制文件，通过子命令使用。',
       packages: {
         brew: { package: 'clickhouse' },
         // ClickHouse 需要其自身的 apt 仓库
@@ -668,13 +668,13 @@ const clickhouseDependencies: EngineDependencies = {
           '或使用 SpinDB：spindb engines download clickhouse 25.12',
         ],
         linux: [
-          'ClickHouse 提供官方包。',
+          'ClickHouse 提供官方软件包。',
           '添加其 apt 仓库：https://clickhouse.com/docs/en/install#install-from-deb-packages',
           '或使用 SpinDB：spindb engines download clickhouse 25.12',
         ],
         win32: [
           'ClickHouse 官方不支持 Windows。',
-          '请使用 WSL2 并遵循 Linux 安装说明。',
+          '请使用 WSL2 并参考 Linux 安装说明。',
         ],
       },
     },
@@ -687,19 +687,19 @@ const clickhouseDependencies: EngineDependencies = {
 
 /**
  * usql - 通用 SQL 客户端
- * 支持 PostgreSQL、MySQL、SQLite 以及其他 20 多种数据库
+ * 支持 PostgreSQL、MySQL、SQLite 及其他 20 多种数据库
  * https://github.com/xo/usql
  */
 export const usqlDependency: Dependency = {
   name: 'usql',
   binary: 'usql',
-  description: '具备自动补全、语法高亮和多数据库支持的通用 SQL 客户端',
+  description: '通用 SQL 客户端，具有自动补全、语法高亮和多数据库支持',
   packages: {
     brew: {
       package: 'xo/xo/usql',
       preInstall: ['brew tap xo/xo'],
     },
-    // 注意：usql 不在标准的 Linux 包仓库中，必须手动安装
+    // 注意：usql 不在标准的 Linux 包仓库中，必须使用手动安装
   },
   manualInstall: {
     darwin: [
@@ -715,13 +715,13 @@ export const usqlDependency: Dependency = {
 }
 
 /**
- * pgcli - 具备自动补全和语法高亮的 PostgreSQL CLI
+ * pgcli - 具有自动补全和语法高亮的 PostgreSQL CLI
  * https://github.com/dbcli/pgcli
  */
 export const pgcliDependency: Dependency = {
   name: 'pgcli',
   binary: 'pgcli',
-  description: '具备智能自动补全和语法高亮的 PostgreSQL CLI',
+  description: '具有智能自动补全和语法高亮的 PostgreSQL CLI',
   packages: {
     brew: { package: 'pgcli' },
     apt: { package: 'pgcli' },
@@ -743,13 +743,13 @@ export const pgcliDependency: Dependency = {
 }
 
 /**
- * mycli - 具备自动补全和语法高亮的 MySQL CLI
+ * mycli - 具有自动补全和语法高亮的 MySQL CLI
  * https://github.com/dbcli/mycli
  */
 export const mycliDependency: Dependency = {
   name: 'mycli',
   binary: 'mycli',
-  description: '具备智能自动补全和语法高亮的 MySQL/MariaDB CLI',
+  description: '具有智能自动补全和语法高亮的 MySQL/MariaDB CLI',
   packages: {
     brew: { package: 'mycli' },
     apt: { package: 'mycli' },
@@ -771,13 +771,13 @@ export const mycliDependency: Dependency = {
 }
 
 /**
- * litecli - 具备自动补全和语法高亮的 SQLite CLI
+ * litecli - 具有自动补全和语法高亮的 SQLite CLI
  * https://github.com/dbcli/litecli
  */
 export const litecliDependency: Dependency = {
   name: 'litecli',
   binary: 'litecli',
-  description: '具备智能自动补全和语法高亮的 SQLite CLI',
+  description: '具有智能自动补全和语法高亮的 SQLite CLI',
   packages: {
     brew: { package: 'litecli' },
     apt: { package: 'litecli' },
@@ -799,13 +799,13 @@ export const litecliDependency: Dependency = {
 }
 
 /**
- * iredis - 具备自动补全和语法高亮的 Redis CLI
+ * iredis - 具有自动补全和语法高亮的 Redis CLI
  * https://github.com/laixintao/iredis
  */
 export const iredisDependency: Dependency = {
   name: 'iredis',
   binary: 'iredis',
-  description: '具备智能自动补全和语法高亮的 Redis CLI',
+  description: '具有智能自动补全和语法高亮的 Redis CLI',
   packages: {
     brew: { package: 'iredis' },
     // 大多数平台使用 pip install
@@ -824,7 +824,7 @@ export const iredisDependency: Dependency = {
 // 注册表
 // =============================================================================
 
-// 所有引擎依赖注册表
+// 所有引擎的依赖项注册表
 export const engineDependencies: EngineDependencies[] = [
   postgresqlDependencies,
   mysqlDependencies,
@@ -847,7 +847,7 @@ export function getAllDependencies(): Dependency[] {
   return engineDependencies.flatMap((e) => e.dependencies)
 }
 
-// 获取唯一的依赖项（按二进制名称去重）
+// 获取去重后的唯一依赖项（按二进制文件名称去重）
 export function getUniqueDependencies(): Dependency[] {
   const seen = new Set<string>()
   const unique: Dependency[] = []
@@ -869,7 +869,7 @@ export function getPackageManager(
   return packageManagers.find((pm) => pm.id === id)
 }
 
-// 获取可用于特定平台的包管理器
+// 获取适用于某个平台的所有包管理器
 export function getPackageManagersForPlatform(
   platform: Platform,
 ): PackageManagerConfig[] {

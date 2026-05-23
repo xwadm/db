@@ -1,13 +1,12 @@
 /**
- * 测试所有带 --json 标志的命令输出有效的 JSON。
+ * 测试所有带 --json 标志的命令是否输出有效 JSON。
  *
  * 此测试套件确保：
  * 1. 带 --json 标志的命令输出纯 JSON（无额外文本）
- * 2. JSON 是可解析的
- * 3. 防止 --json 停止工作的回归问题
+ * 2. JSON 可解析
+ * 3. 不会出现 --json 停止工作的回退情况
  *
- * 注意：需要参数的命令（如容器名称）会单独测试
- * 预期的 JSON 错误输出。
+ * 注意：需要参数的命令（例如容器名称）将单独测试，并期望输出 JSON 格式的错误。
  */
 
 import { describe, it } from 'node:test'
@@ -25,7 +24,7 @@ type CommandResult = {
 /**
  * 运行 CLI 命令并捕获输出
  * @param args - 传递给 CLI 的命令参数
- * @param timeout - 命令超时时间（毫秒，默认：30000，对于 doctor 等慢速命令使用 120000）
+ * @param timeout - 命令超时时间（毫秒，默认：30000，对于 doctor 等慢命令使用 120000）
  */
 function runCommand(args: string, timeout = 30000): CommandResult {
   try {
@@ -52,7 +51,7 @@ function isValidJson(output: string): { valid: boolean; error?: string } {
   const trimmed = output.trim()
 
   if (!trimmed) {
-    return { valid: false, error: '空输出' }
+    return { valid: false, error: '输出为空' }
   }
 
   try {
@@ -65,7 +64,7 @@ function isValidJson(output: string): { valid: boolean; error?: string } {
 }
 
 /**
- * 断言输出为有效 JSON，并提供有用的错误信息
+ * 断言输出为有效的 JSON，并提供有用的错误消息
  */
 function assertValidJson(
   output: string,
@@ -88,29 +87,29 @@ describe('JSON 输出验证', () => {
 
     it('spindb list --json', () => {
       const result = runCommand('list --json')
-      // list --json 即使没有容器也应成功
+      // list --json 即使没有容器也应该成功
       if (result.exitCode === 0) {
         assertValidJson(result.stdout, 'list --json')
         const parsed = JSON.parse(result.stdout.trim())
-        // 应输出容器数组
+        // 应该是一个容器数组
         if (!Array.isArray(parsed)) {
-          throw new Error('list --json 应输出数组')
+          throw new Error('list --json 应输出一个数组')
         }
       } else {
-        // 如果失败，错误仍应为 JSON
-        assertValidJson(result.stdout || result.stderr, 'list --json (错误)')
+        // 如果失败，错误信息也应该是 JSON
+        assertValidJson(result.stdout || result.stderr, 'list --json（错误）')
       }
     })
 
     it('spindb info --json（列出所有容器）', () => {
       const result = runCommand('info --json')
-      // info --json 不带容器名称时列出所有容器
+      // info --json 不带容器名称将列出所有容器
       if (result.exitCode === 0) {
         assertValidJson(result.stdout, 'info --json')
         const parsed = JSON.parse(result.stdout.trim())
-        // 应输出容器信息数组
+        // 应该是一个容器信息数组
         if (!Array.isArray(parsed)) {
-          throw new Error('info --json 应输出数组')
+          throw new Error('info --json 应输出一个数组')
         }
       }
     })
@@ -120,10 +119,10 @@ describe('JSON 输出验证', () => {
       if (result.exitCode === 0) {
         assertValidJson(result.stdout, 'engines --json')
       } else {
-        // 如果没有安装引擎可能会失败，但仍应为 JSON 错误
+        // 可能因为没有安装引擎而失败，但仍应是 JSON 错误
         const output = result.stdout || result.stderr
         if (output.trim()) {
-          assertValidJson(output, 'engines --json (错误)')
+          assertValidJson(output, 'engines --json（错误）')
         }
       }
     })
@@ -135,26 +134,26 @@ describe('JSON 输出验证', () => {
       } else {
         const output = result.stdout || result.stderr
         if (output.trim()) {
-          assertValidJson(output, 'engines list --json (错误)')
+          assertValidJson(output, 'engines list --json（错误）')
         }
       }
     })
 
     it('spindb databases list --json（所有容器）', () => {
       const result = runCommand('databases list --json')
-      // databases list --json 即使没有容器也应成功
+      // databases list --json 即使没有容器也应该成功
       if (result.exitCode === 0) {
         assertValidJson(result.stdout, 'databases list --json')
         const parsed = JSON.parse(result.stdout.trim())
-        // 应输出包含其数据库的容器数组
+        // 应该是一个包含容器及其数据库的数组
         if (!Array.isArray(parsed)) {
-          throw new Error('databases list --json 应输出数组')
+          throw new Error('databases list --json 应输出一个数组')
         }
         // 如果有容器，验证结构
         for (const item of parsed) {
           if (!item.container || !item.engine || !item.databases) {
             throw new Error(
-              'databases list 项缺少必需字段（container、engine、databases）',
+              'databases list 条目缺少必需字段（container, engine, databases）',
             )
           }
         }
@@ -163,10 +162,10 @@ describe('JSON 输出验证', () => {
 
     it('spindb engines supported --json', () => {
       const result = runCommand('engines supported --json')
-      // 这应始终成功 - 从 engines.json 读取
+      // 此命令应始终成功——它从 engines.json 读取数据
       if (result.exitCode !== 0) {
         throw new Error(
-          `engines supported --json 以退出码 ${result.exitCode} 失败`,
+          `engines supported --json 失败，退出码为 ${result.exitCode}`,
         )
       }
       assertValidJson(result.stdout, 'engines supported --json')
@@ -174,9 +173,7 @@ describe('JSON 输出验证', () => {
       // 验证结构
       const parsed = JSON.parse(result.stdout.trim())
       if (!parsed.engines) {
-        throw new Error(
-          'engines supported --json 应包含 "engines" 对象',
-        )
+        throw new Error('engines supported --json 应包含一个 "engines" 对象')
       }
       if (!parsed.engines.postgresql) {
         throw new Error('engines supported --json 应包含 postgresql')
@@ -188,53 +185,53 @@ describe('JSON 输出验证', () => {
       if (result.exitCode === 0) {
         assertValidJson(result.stdout, 'config show --json')
       } else {
-        // 配置可能不存在，但错误应为 JSON
+        // 配置可能不存在，但错误信息应为 JSON
         const output = result.stdout || result.stderr
         if (output.trim()) {
-          assertValidJson(output, 'config show --json (错误)')
+          assertValidJson(output, 'config show --json（错误）')
         }
       }
     })
 
     it('spindb doctor --json', () => {
-      // doctor 命令在 Windows CI 上可能较慢，因为系统检查
-      //（为所有 18 个引擎生成二进制检测 - 数十个进程生成）
+      // 在 Windows CI 上，doctor 命令可能因系统检查而变慢
+      // （为所有 18 个引擎生成二进制检测——数十次进程生成）
       const result = runCommand('doctor --json', 120000)
       // doctor --json 应始终输出有效的 JSON
       assertValidJson(result.stdout, 'doctor --json')
 
-      // 验证结构 - doctor 输出检查结果数组
+      // 验证结构——doctor 输出一个检查结果数组
       const parsed = JSON.parse(result.stdout.trim())
       if (!Array.isArray(parsed)) {
-        throw new Error('doctor --json 应输出检查数组')
+        throw new Error('doctor --json 应输出一个检查项数组')
       }
-      // 每个检查应有 name 和 status
+      // 每个检查项都应包含 name 和 status
       for (const check of parsed) {
         if (!check.name || !check.status) {
-          throw new Error('doctor 检查缺少必需字段（name、status）')
+          throw new Error('doctor 检查项缺少必需字段（name, status）')
         }
       }
     })
   })
 
-  describe('需要参数的命令（错误情况）', () => {
-    // 这些命令需要参数，缺少参数时应输出 JSON 错误
+  describe('需要参数的命令（错误场景）', () => {
+    // 这些命令需要参数，缺少时应该输出 JSON 错误
 
-    it('spindb url --json（无容器）应失败', () => {
+    it('spindb url --json（无容器参数）应失败', () => {
       const result = runCommand('url --json')
       // url 需要容器名称
       if (result.exitCode === 0) {
-        throw new Error('url --json 无容器参数时应失败')
+        throw new Error('url --json 在缺少容器参数时应该失败')
       }
     })
 
     it('spindb info nonexistent --json 应输出 JSON 错误', () => {
       const result = runCommand('info nonexistent-container-12345 --json')
-      // 应失败，因为容器不存在
+      // 因为容器不存在，应该失败
       if (result.exitCode === 0) {
-        throw new Error('info --json 对不存在的容器应失败')
+        throw new Error('info --json 对于不存在的容器应该失败')
       }
-      // 错误应为 JSON
+      // 错误信息应为 JSON
       const output = result.stdout.trim()
       if (output) {
         assertValidJson(output, 'info nonexistent --json')
@@ -244,7 +241,7 @@ describe('JSON 输出验证', () => {
     it('spindb url nonexistent --json 应输出 JSON 错误', () => {
       const result = runCommand('url nonexistent-container-12345 --json')
       if (result.exitCode === 0) {
-        throw new Error('url --json 对不存在的容器应失败')
+        throw new Error('url --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -255,7 +252,7 @@ describe('JSON 输出验证', () => {
     it('spindb attach /nonexistent/path --json 应输出 JSON 错误', () => {
       const result = runCommand('attach /nonexistent/path/db.sqlite --json')
       if (result.exitCode === 0) {
-        throw new Error('attach --json 对不存在的路径应失败')
+        throw new Error('attach --json 对于不存在的路径应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -266,7 +263,7 @@ describe('JSON 输出验证', () => {
     it('spindb detach nonexistent --json 应输出 JSON 错误', () => {
       const result = runCommand('detach nonexistent-db-12345 --json')
       if (result.exitCode === 0) {
-        throw new Error('detach --json 对不存在的容器应失败')
+        throw new Error('detach --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -279,9 +276,7 @@ describe('JSON 输出验证', () => {
         'databases list nonexistent-container-12345 --json',
       )
       if (result.exitCode === 0) {
-        throw new Error(
-          'databases list --json 对不存在的容器应失败',
-        )
+        throw new Error('databases list --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -299,9 +294,7 @@ describe('JSON 输出验证', () => {
         'databases add nonexistent-container-12345 testdb --json',
       )
       if (result.exitCode === 0) {
-        throw new Error(
-          'databases add --json 对不存在的容器应失败',
-        )
+        throw new Error('databases add --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -318,9 +311,7 @@ describe('JSON 输出验证', () => {
         'databases remove nonexistent-container-12345 testdb --json',
       )
       if (result.exitCode === 0) {
-        throw new Error(
-          'databases remove --json 对不存在的容器应失败',
-        )
+        throw new Error('databases remove --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -337,9 +328,7 @@ describe('JSON 输出验证', () => {
         'databases sync nonexistent-container-12345 olddb newdb --json',
       )
       if (result.exitCode === 0) {
-        throw new Error(
-          'databases sync --json 对不存在的容器应失败',
-        )
+        throw new Error('databases sync --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
@@ -356,18 +345,14 @@ describe('JSON 输出验证', () => {
         'databases set-default nonexistent-container-12345 testdb --json',
       )
       if (result.exitCode === 0) {
-        throw new Error(
-          'databases set-default --json 对不存在的容器应失败',
-        )
+        throw new Error('databases set-default --json 对于不存在的容器应该失败')
       }
       const output = result.stdout.trim()
       if (output) {
         assertValidJson(output, 'databases set-default nonexistent --json')
         const parsed = JSON.parse(output)
         if (!parsed.error) {
-          throw new Error(
-            'databases set-default 错误应包含 "error" 字段',
-          )
+          throw new Error('databases set-default 错误应包含 "error" 字段')
         }
       }
     })
@@ -378,14 +363,14 @@ describe('JSON 输出验证', () => {
       const result = runCommand('list --json')
       if (result.exitCode === 0) {
         const parsed = JSON.parse(result.stdout.trim())
-        // 应为数组
+        // 应为一个数组
         if (!Array.isArray(parsed)) {
-          throw new Error('list --json 应输出数组')
+          throw new Error('list --json 应输出一个数组')
         }
-        // 每个容器应有必需字段（如果存在）
+        // 每个容器应包含必需字段（如果存在）
         for (const container of parsed) {
           if (!container.name || !container.engine) {
-            throw new Error('容器缺少必需字段（name、engine）')
+            throw new Error('容器缺少必需字段（name, engine）')
           }
         }
       }
@@ -397,9 +382,7 @@ describe('JSON 输出验证', () => {
         const parsed = JSON.parse(result.stdout.trim())
         for (const container of parsed) {
           if (typeof container.queryLanguage !== 'string') {
-            throw new Error(
-              `容器 "${container.name}" 缺少 queryLanguage 字段`,
-            )
+            throw new Error(`容器 "${container.name}" 缺少 queryLanguage 字段`)
           }
           if (
             container.runtime !== 'server' &&
@@ -470,9 +453,7 @@ describe('JSON 输出验证', () => {
               engine.connectionScheme !== null &&
               typeof engine.connectionScheme !== 'string'
             ) {
-              throw new Error(
-                `引擎 "${engine.engine}" 缺少 connectionScheme`,
-              )
+              throw new Error(`引擎 "${engine.engine}" 缺少 connectionScheme`)
             }
           }
         }
@@ -487,12 +468,12 @@ describe('JSON 输出验证', () => {
           for (const item of parsed) {
             if (typeof item.queryLanguage !== 'string') {
               throw new Error(
-                `databases list 项 "${item.container}" 缺少 queryLanguage`,
+                `databases list 条目 "${item.container}" 缺少 queryLanguage`,
               )
             }
             if (item.runtime !== 'server' && item.runtime !== 'embedded') {
               throw new Error(
-                `databases list 项 "${item.container}" 的 runtime 无效：${item.runtime}`,
+                `databases list 条目 "${item.container}" 的 runtime 无效：${item.runtime}`,
               )
             }
             if (
@@ -500,7 +481,7 @@ describe('JSON 输出验证', () => {
               typeof item.connectionScheme !== 'string'
             ) {
               throw new Error(
-                `databases list 项 "${item.container}" 缺少 connectionScheme`,
+                `databases list 条目 "${item.container}" 缺少 connectionScheme`,
               )
             }
           }
@@ -512,7 +493,7 @@ describe('JSON 输出验证', () => {
       const result = runCommand('engines supported --json')
       const parsed = JSON.parse(result.stdout.trim())
 
-      // 验证 schema 引用
+      // 验证模式引用
       if (!parsed.$schema) {
         throw new Error('缺少 "$schema" 字段')
       }
@@ -522,7 +503,7 @@ describe('JSON 输出验证', () => {
         throw new Error('缺少或无效的 "engines" 对象')
       }
 
-      // 验证至少一个引擎具有必需字段
+      // 验证至少一个引擎包含必需字段
       const postgresql = parsed.engines.postgresql
       if (!postgresql) {
         throw new Error('缺少 postgresql 引擎')
@@ -533,23 +514,23 @@ describe('JSON 输出验证', () => {
     })
 
     it('doctor --json 应具有正确的结构', () => {
-      // doctor 命令在 Windows CI 上可能较慢，因为系统检查
-      //（为所有 18 个引擎生成二进制检测 - 数十个进程生成）
+      // 在 Windows CI 上，doctor 命令可能因系统检查而变慢
+      // （为所有 18 个引擎生成二进制检测——数十次进程生成）
       const result = runCommand('doctor --json', 120000)
       const parsed = JSON.parse(result.stdout.trim())
 
-      // doctor 输出检查数组
+      // doctor 输出一个检查项数组
       if (!Array.isArray(parsed)) {
-        throw new Error('doctor --json 应输出数组')
+        throw new Error('doctor --json 应输出一个数组')
       }
 
-      // 每个检查应有 name、status 和 message
+      // 每个检查项应包含 name、status 和 message
       for (const check of parsed) {
         if (!check.name) {
-          throw new Error('检查缺少 "name" 字段')
+          throw new Error('检查项缺少 "name" 字段')
         }
         if (!check.status) {
-          throw new Error('检查缺少 "status" 字段')
+          throw new Error('检查项缺少 "status" 字段')
         }
         if (!['ok', 'warning', 'error'].includes(check.status)) {
           throw new Error(`无效的检查状态：${check.status}`)

@@ -1,95 +1,306 @@
-/**
- * 事务管理器单元测试
- */
-
 import { describe, it } from 'node:test'
+import {
+  TransactionManager,
+  withTransaction,
+} from '../../core/transaction-manager'
 import { assert, assertEqual } from '../utils/assertions'
-import { TransactionManager, TransactionState } from '../../core/transaction-manager'
-import { SpinDBError, ErrorCodes } from '../../core/error-handler'
 
 describe('事务管理器', () => {
-  describe('事务状态跟踪', () => {
-    it('应该正确跟踪事务状态转换', () => {
-      const manager = new TransactionManager()
-      const txId = manager.beginTransaction()
-      
-      assertEqual(manager.getState(txId), TransactionState.ACTIVE, '事务应该是 ACTIVE 状态')
-      
-      manager.commit(txId)
-      assertEqual(manager.getState(txId), TransactionState.COMMITTED, '事务应该是 COMMITTED 状态')
+  describe('添加回滚操作', () => {
+    it('应将回滚操作添加到栈中', () => {
+      const tx = new TransactionManager()
+
+      tx.addRollback({
+        description: '操作 1',
+        execute: async () => {},
+      })
+      tx.addRollback({
+        description: '操作 2',
+        execute: async () => {},
+      })
+
+      assertEqual(tx.getPendingCount(), 2, '应有 2 个待处理操作')
     })
 
-    it('应该正确跟踪回滚状态', () => {
-      const manager = new TransactionManager()
-      const txId = manager.beginTransaction()
-      
-      manager.rollback(txId)
-      assertEqual(manager.getState(txId), TransactionState.ABORTED, '事务应该是 ABORTED 状态')
-    })
-  })
+    it('提交后添加回滚操作应抛出异常', () => {
+      const tx = new TransactionManager()
+      tx.commit()
 
-  describe('事务隔离', () => {
-    it('应该为每个事务维护独立的上下文', () => {
-      const manager = new TransactionManager()
-      const txId1 = manager.beginTransaction()
-      const txId2 = manager.beginTransaction()
-      
-      manager.setContext(txId1, 'key', 'value1')
-      manager.setContext(txId2, 'key', 'value2')
-      
-      assertEqual(manager.getContext(txId1, 'key'), 'value1', '事务1应该有独立的上下文')
-      assertEqual(manager.getContext(txId2, 'key'), 'value2', '事务2应该有独立的上下文')
-    })
-  })
-
-  describe('死锁检测', () => {
-    it('应该检测简单的死锁', () => {
-      const manager = new TransactionManager()
-      const txId1 = manager.beginTransaction()
-      const txId2 = manager.beginTransaction()
-      
-      // 事务1锁定资源A，尝试锁定资源B
-      manager.acquireLock(txId1, 'resourceA')
-      manager.acquireLock(txId1, 'resourceB')
-      
-      // 事务2锁定资源B，尝试锁定资源A（形成死锁）
-      manager.acquireLock(txId2, 'resourceB')
-      
+      let threw = false
       try {
-        manager.acquireLock(txId2, 'resourceA')
-        assert(false, '应该检测到死锁')
+        tx.addRollback({
+          description: '应失败',
+          execute: async () => {},
+        })
       } catch (error) {
-        assert(error instanceof SpinDBError, '应该抛出 SpinDBError')
-        assertEqual((error as SpinDBError).code, ErrorCodes.DEADLOCK_DETECTED, '应该是死锁错误')
+        threw = true
+        assert(
+          (error as Error).message.includes('after commit'),
+          '错误消息应提及提交',
+        )
       }
+
+      assert(threw, '应抛出异常')
     })
   })
 
-  describe('事务超时', () => {
-    it('应该支持事务超时', async () => {
-      const manager = new TransactionManager({ timeout: 100 })
-      const txId = manager.beginTransaction()
-      
-      // 等待超时
-      await new Promise(resolve => setTimeout(resolve, 150))
-      
-      assertEqual(manager.getState(txId), TransactionState.ABORTED, '超时的事务应该被中止')
+  describe('回滚', () => {
+    it('应按相反顺序执行回滚操作', async () => {
+      const tx = new TransactionManager()
+      const executionOrder: number[] = []
+
+      tx.addRollback({
+        description: '第一个添加',
+        execute: async () => {
+          executionOrder.push(1)
+        },
+      })
+      tx.addRollback({
+        description: '第二个添加',
+        execute: async () => {
+          executionOrder.push(2)
+        },
+      })
+      tx.addRollback({
+        description: '第三个添加',
+        execute: async () => {
+          executionOrder.push(3)
+        },
+      })
+
+      await tx.rollback()
+
+      assertEqual(executionOrder.length, 3, '所有操作都应执行')
+      assertEqual(executionOrder[0], 3, '第三个添加的操作应先执行（后进先出）')
+      assertEqual(executionOrder[1], 2, '第二个添加的操作应第二个执行')
+      assertEqual(executionOrder[2], 1, '第一个添加的操作应最后执行')
+    })
+
+    it('即使其中一个操作失败，也应继续回滚', async () => {
+      const tx = new TransactionManager()
+      const executionOrder: string[] = []
+
+      tx.addRollback({
+        description: '会成功',
+        execute: async () => {
+          executionOrder.push('成功1')
+        },
+      })
+      tx.addRollback({
+        description: '会失败',
+        execute: async () => {
+          executionOrder.push('失败')
+          throw new Error('回滚失败')
+        },
+      })
+      tx.addRollback({
+        description: '也会成功',
+        execute: async () => {
+          executionOrder.push('成功2')
+        },
+      })
+
+      // 不应抛出异常
+      await tx.rollback()
+
+      assertEqual(executionOrder.length, 3, '所有操作都应尝试执行')
+      assert(executionOrder.includes('失败'), '失败的操作应已被尝试')
+      assert(executionOrder.includes('成功1'), '成功的操作应执行')
+      assert(executionOrder.includes('成功2'), '成功的操作应执行')
+    })
+
+    it('回滚后应清空栈', async () => {
+      const tx = new TransactionManager()
+
+      tx.addRollback({
+        description: '操作',
+        execute: async () => {},
+      })
+
+      await tx.rollback()
+
+      assertEqual(tx.getPendingCount(), 0, '回滚后栈应为空')
+    })
+
+    it('栈为空时不应执行任何操作', async () => {
+      const tx = new TransactionManager()
+
+      // 不应抛出异常
+      await tx.rollback()
+
+      assertEqual(tx.getPendingCount(), 0, '栈应保持为空')
+    })
+
+    it('已提交后应跳过回滚', async () => {
+      const tx = new TransactionManager()
+      let executed = false
+
+      tx.addRollback({
+        description: '不应执行',
+        execute: async () => {
+          executed = true
+        },
+      })
+
+      tx.commit()
+      await tx.rollback()
+
+      assert(!executed, '提交后不应执行回滚')
     })
   })
 
-  describe('嵌套事务', () => {
-    it('应该支持保存点', () => {
-      const manager = new TransactionManager()
-      const txId = manager.beginTransaction()
-      
-      manager.setContext(txId, 'data', 'initial')
-      const savepoint = manager.createSavepoint(txId)
-      
-      manager.setContext(txId, 'data', 'modified')
-      assertEqual(manager.getContext(txId, 'data'), 'modified', '数据应该被修改')
-      
-      manager.rollbackToSavepoint(txId, savepoint)
-      assertEqual(manager.getContext(txId, 'data'), 'initial', '数据应该回滚到保存点')
+  describe('提交', () => {
+    it('应清空回滚栈', () => {
+      const tx = new TransactionManager()
+
+      tx.addRollback({
+        description: '操作 1',
+        execute: async () => {},
+      })
+      tx.addRollback({
+        description: '操作 2',
+        execute: async () => {},
+      })
+
+      tx.commit()
+
+      assertEqual(tx.getPendingCount(), 0, '提交后栈应为空')
+      assert(tx.isCommitted(), '应标记为已提交')
     })
+
+    it('应为幂等操作', () => {
+      const tx = new TransactionManager()
+
+      tx.addRollback({
+        description: '操作',
+        execute: async () => {},
+      })
+
+      tx.commit()
+      tx.commit() // 不应抛出异常
+
+      assert(tx.isCommitted(), '应保持已提交状态')
+    })
+  })
+
+  describe('检查是否已提交', () => {
+    it('提交前应返回 false', () => {
+      const tx = new TransactionManager()
+
+      assert(!tx.isCommitted(), '初始状态不应为已提交')
+
+      tx.addRollback({
+        description: '操作',
+        execute: async () => {},
+      })
+
+      assert(!tx.isCommitted(), '添加回滚操作后不应为已提交')
+    })
+
+    it('提交后应返回 true', () => {
+      const tx = new TransactionManager()
+      tx.commit()
+
+      assert(tx.isCommitted(), '调用 commit() 后应为已提交')
+    })
+  })
+
+  describe('获取待处理操作数量', () => {
+    it('应返回正确的数量', () => {
+      const tx = new TransactionManager()
+
+      assertEqual(tx.getPendingCount(), 0, '初始应为 0')
+
+      tx.addRollback({
+        description: '操作 1',
+        execute: async () => {},
+      })
+      assertEqual(tx.getPendingCount(), 1, '添加一个后应为 1')
+
+      tx.addRollback({
+        description: '操作 2',
+        execute: async () => {},
+      })
+      assertEqual(tx.getPendingCount(), 2, '添加两个后应为 2')
+    })
+  })
+})
+
+describe('事务包裹函数 withTransaction', () => {
+  it('操作成功时应提交', async () => {
+    let rollbackExecuted = false
+
+    const result = await withTransaction(async (tx) => {
+      tx.addRollback({
+        description: '不应执行',
+        execute: async () => {
+          rollbackExecuted = true
+        },
+      })
+
+      return 'success'
+    })
+
+    assertEqual(result, 'success', '应返回操作结果')
+    assert(!rollbackExecuted, '成功时不应执行回滚')
+  })
+
+  it('操作失败时应回滚并重新抛出异常', async () => {
+    let rollbackExecuted = false
+
+    let threw = false
+    try {
+      await withTransaction(async (tx) => {
+        tx.addRollback({
+          description: '应执行',
+          execute: async () => {
+            rollbackExecuted = true
+          },
+        })
+
+        throw new Error('操作失败')
+      })
+    } catch (error) {
+      threw = true
+      assertEqual((error as Error).message, '操作失败', '应重新抛出原始错误')
+    }
+
+    assert(threw, '应抛出异常')
+    assert(rollbackExecuted, '应已执行回滚')
+  })
+
+  it('操作失败时应按相反顺序执行回滚', async () => {
+    const executionOrder: number[] = []
+
+    try {
+      await withTransaction(async (tx) => {
+        tx.addRollback({
+          description: '第一个',
+          execute: async () => {
+            executionOrder.push(1)
+          },
+        })
+        tx.addRollback({
+          description: '第二个',
+          execute: async () => {
+            executionOrder.push(2)
+          },
+        })
+        tx.addRollback({
+          description: '第三个',
+          execute: async () => {
+            executionOrder.push(3)
+          },
+        })
+
+        throw new Error('失败')
+      })
+    } catch {
+      // 预期异常
+    }
+
+    assertEqual(executionOrder[0], 3, '应按相反顺序执行')
+    assertEqual(executionOrder[1], 2, '应按相反顺序执行')
+    assertEqual(executionOrder[2], 1, '应按相反顺序执行')
   })
 })

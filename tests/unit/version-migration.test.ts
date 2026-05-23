@@ -1,132 +1,292 @@
-/**
- * 版本迁移单元测试
- * 
- * 测试版本检测和迁移逻辑，包括各种数据库引擎的版本解析和测试容器检测。
- */
-
 import { describe, it } from 'node:test'
-import { assert, assertEqual } from '../utils/assertions'
 import {
   getMajorVersion,
-  isTestContainer,
-  parseDocumentDBVersion,
+  getDocumentDBMajorVersion,
+  isVersionSupported,
+  isDocumentDBVersionSupported,
+  getTargetVersion,
+  getDocumentDBTargetVersion,
 } from '../../core/version-migration'
+import { isTestContainer } from '../../core/test-cleanup'
 import { Engine } from '../../types'
+import { assert, assertEqual, assertNullish } from '../utils/assertions'
 
 describe('版本迁移', () => {
-  describe('getMajorVersion', () => {
-    it('应该为 PostgreSQL 提取主版本', () => {
-      assertEqual(getMajorVersion('17.7.0', Engine.PostgreSQL), '17', 'PostgreSQL 应该提取 17')
-      assertEqual(getMajorVersion('16.4.0', Engine.PostgreSQL), '16', 'PostgreSQL 应该提取 16')
+  describe('获取主版本', () => {
+    describe('PostgreSQL（一位数主版本）', () => {
+      it('应从完整版本中提取主版本', () => {
+        const major = getMajorVersion(Engine.PostgreSQL, '17.2.0')
+        assertEqual(major, '17', '应提取主版本 17')
+      })
+
+      it('应从 15.x 版本中提取主版本', () => {
+        const major = getMajorVersion(Engine.PostgreSQL, '15.15.0')
+        assertEqual(major, '15', '应提取主版本 15')
+      })
+
+      it('不支持的主版本应返回 null', () => {
+        const major = getMajorVersion(Engine.PostgreSQL, '12.0.0')
+        assertNullish(major, 'PostgreSQL 12 不受支持')
+      })
     })
 
-    it('应该为 MySQL 提取主版本', () => {
-      assertEqual(getMajorVersion('8.0.33', Engine.MySQL), '8', 'MySQL 应该提取 8')
-      assertEqual(getMajorVersion('5.7.42', Engine.MySQL), '5', 'MySQL 应该提取 5')
+    describe('MySQL（两部分主版本）', () => {
+      it('应提取主版本 8.4', () => {
+        const major = getMajorVersion(Engine.MySQL, '8.4.3')
+        assertEqual(major, '8.4', '应提取主版本 8.4')
+      })
+
+      it('应提取主版本 8.0', () => {
+        const major = getMajorVersion(Engine.MySQL, '8.0.40')
+        assertEqual(major, '8.0', '应提取主版本 8.0')
+      })
+
+      it('应提取主版本 9.1', () => {
+        const major = getMajorVersion(Engine.MySQL, '9.1.0')
+        assertEqual(major, '9.1', '应提取主版本 9.1')
+      })
     })
 
-    it('应该为 MongoDB 提取主版本', () => {
-      assertEqual(getMajorVersion('7.0.5', Engine.MongoDB), '7', 'MongoDB 应该提取 7')
-      assertEqual(getMajorVersion('6.0.12', Engine.MongoDB), '6', 'MongoDB 应该提取 6')
+    describe('MariaDB（两部分主版本）', () => {
+      it('应提取主版本 10.11', () => {
+        const major = getMajorVersion(Engine.MariaDB, '10.11.15')
+        assertEqual(major, '10.11', '应提取主版本 10.11')
+      })
+
+      it('应提取主版本 11.8', () => {
+        const major = getMajorVersion(Engine.MariaDB, '11.8.5')
+        assertEqual(major, '11.8', '应提取主版本 11.8')
+      })
     })
 
-    it('应该为 Redis 提取主版本', () => {
-      assertEqual(getMajorVersion('7.2.4', Engine.Redis), '7', 'Redis 应该提取 7')
-      assertEqual(getMajorVersion('6.2.14', Engine.Redis), '6', 'Redis 应该提取 6')
+    describe('MongoDB（两部分主版本）', () => {
+      it('应提取主版本 8.0', () => {
+        const major = getMajorVersion(Engine.MongoDB, '8.0.17')
+        assertEqual(major, '8.0', '应提取主版本 8.0')
+      })
+
+      it('应提取主版本 7.0', () => {
+        const major = getMajorVersion(Engine.MongoDB, '7.0.28')
+        assertEqual(major, '7.0', '应提取主版本 7.0')
+      })
     })
 
-    it('应该为 DocumentDB 提取主版本', () => {
-      // DocumentDB 版本格式: "17-0.107.0" (PostgreSQL 兼容版本-DocumentDB 版本)
-      assertEqual(getMajorVersion('17-0.107.0', Engine.DocumentDB), '17', 'DocumentDB 应该提取 17')
-      assertEqual(getMajorVersion('16-0.100.0', Engine.DocumentDB), '16', 'DocumentDB 应该提取 16')
+    describe('Redis（一位数主版本）', () => {
+      it('应提取主版本 7', () => {
+        const major = getMajorVersion(Engine.Redis, '7.4.7')
+        assertEqual(major, '7', '应提取主版本 7')
+      })
+
+      it('应提取主版本 8', () => {
+        const major = getMajorVersion(Engine.Redis, '8.4.0')
+        assertEqual(major, '8', '应提取主版本 8')
+      })
     })
 
-    it('应该为 Valkey 提取主版本', () => {
-      assertEqual(getMajorVersion('7.2.5', Engine.Valkey), '7', 'Valkey 应该提取 7')
+    describe('ClickHouse（YY.MM 主版本）', () => {
+      it('应提取主版本 25.12', () => {
+        const major = getMajorVersion(Engine.ClickHouse, '25.12.3.21')
+        assertEqual(major, '25.12', '应提取主版本 25.12')
+      })
     })
 
-    it('应该为 TigerBeetle 提取主版本', () => {
-      assertEqual(getMajorVersion('0.16.3', Engine.TigerBeetle), '0', 'TigerBeetle 应该提取 0')
-    })
+    describe('Qdrant/Meilisearch（一位数主版本）', () => {
+      it('Qdrant 应提取主版本 1', () => {
+        const major = getMajorVersion(Engine.Qdrant, '1.16.3')
+        assertEqual(major, '1', '应提取主版本 1')
+      })
 
-    it('应该为 TypeDB 提取主版本', () => {
-      assertEqual(getMajorVersion('2.26.6', Engine.TypeDB), '2', 'TypeDB 应该提取 2')
-    })
-
-    it('应该为 Weaviate 提取主版本', () => {
-      assertEqual(getMajorVersion('1.35.7', Engine.Weaviate), '1', 'Weaviate 应该提取 1')
+      it('Meilisearch 应提取主版本 1', () => {
+        const major = getMajorVersion(Engine.Meilisearch, '1.33.1')
+        assertEqual(major, '1', '应提取主版本 1')
+      })
     })
   })
 
-  describe('isTestContainer', () => {
-    it('应该通过容器名称检测测试容器', () => {
-      assert(isTestContainer({ name: 'spindb-test-postgres-123' }), '应该检测 spindb-test 前缀')
-      assert(isTestContainer({ name: 'test-mysql-456' }), '应该检测 test- 前缀')
-      assert(isTestContainer({ name: 'spindb-testcontainer-redis' }), '应该检测 testcontainer')
+  describe('获取 DocumentDB 主版本', () => {
+    it('应从 DocumentDB 版本中提取主版本', () => {
+      const major = getDocumentDBMajorVersion('17-0.107.0')
+      assertEqual(major, '17', '应提取主版本 17')
     })
 
-    it('应该通过标签检测测试容器', () => {
-      assert(isTestContainer({ labels: { 'spindb.test': 'true' } }), '应该检测 spindb.test 标签')
-      assert(isTestContainer({ labels: { 'testcontainer': 'true' } }), '应该检测 testcontainer 标签')
+    it('无效格式应返回 null', () => {
+      const major = getDocumentDBMajorVersion('invalid')
+      assertNullish(major, '无效格式应返回 null')
     })
 
-    it('应该通过环境变量检测测试容器', () => {
-      assert(isTestContainer({ env: { 'SPINDB_TEST': '1' } }), '应该检测 SPINDB_TEST 环境变量')
-      assert(isTestContainer({ env: { 'TESTCONTAINER': 'true' } }), '应该检测 TESTCONTAINER 环境变量')
-    })
-
-    it('不应该将生产容器识别为测试容器', () => {
-      assert(!isTestContainer({ name: 'production-postgres' }), '不应该检测生产容器')
-      assert(!isTestContainer({ name: 'myapp-database' }), '不应该检测应用数据库')
-      assert(!isTestContainer({ labels: {} }), '空标签不应该被检测')
-    })
-
-    it('应该处理复合检测条件', () => {
-      assert(
-        isTestContainer({
-          name: 'myapp-db',
-          labels: { 'spindb.test': 'true' },
-        }),
-        '标签应该优先于名称'
-      )
+    it('不支持的主版本应返回 null', () => {
+      const major = getDocumentDBMajorVersion('16-0.107.0')
+      assertNullish(major, 'PostgreSQL 16 后端不受支持')
     })
   })
 
-  describe('parseDocumentDBVersion', () => {
-    it('应该解析 DocumentDB 复合版本', () => {
-      const parsed = parseDocumentDBVersion('17-0.107.0')
-      assertEqual(parsed.postgresVersion, '17', '应该提取 PostgreSQL 版本 17')
-      assertEqual(parsed.documentDBVersion, '0.107.0', '应该提取 DocumentDB 版本 0.107.0')
+  describe('isVersionSupported', () => {
+    it('对版本映射中当前的 PostgreSQL 版本应返回 true', () => {
+      // 获取 PostgreSQL 17 的当前目标版本
+      const targetVersion = getTargetVersion(Engine.PostgreSQL, '17')
+      assert(targetVersion !== null, 'PostgreSQL 17 应有目标版本')
+      const supported = isVersionSupported(Engine.PostgreSQL, targetVersion!)
+      assert(supported, `PostgreSQL ${targetVersion} 应受支持`)
     })
 
-    it('应该解析不同格式的 DocumentDB 版本', () => {
-      const parsed = parseDocumentDBVersion('16-0.100.0')
-      assertEqual(parsed.postgresVersion, '16', '应该提取 PostgreSQL 版本 16')
-      assertEqual(parsed.documentDBVersion, '0.100.0', '应该提取 DocumentDB 版本 0.100.0')
+    it('对已过时的 PostgreSQL 版本应返回 false', () => {
+      // 使用一个肯定不存在于版本映射中的版本
+      const supported = isVersionSupported(Engine.PostgreSQL, '17.0.1')
+      assert(!supported, 'PostgreSQL 17.0.1 不应受支持（不在版本映射中）')
     })
 
-    it('应该对无效格式返回 null', () => {
-      const parsed = parseDocumentDBVersion('invalid')
-      assertEqual(parsed, null, '无效格式应该返回 null')
+    it('对版本映射中当前的 MySQL 版本应返回 true', () => {
+      // 获取 MySQL 8.4 的当前目标版本
+      const targetVersion = getTargetVersion(Engine.MySQL, '8.4')
+      assert(targetVersion !== null, 'MySQL 8.4 应有目标版本')
+      const supported = isVersionSupported(Engine.MySQL, targetVersion!)
+      assert(supported, `MySQL ${targetVersion} 应受支持`)
     })
 
-    it('应该对标准 PostgreSQL 版本返回 null', () => {
-      const parsed = parseDocumentDBVersion('17.7.0')
-      assertEqual(parsed, null, '标准 PostgreSQL 版本应该返回 null')
+    it('对已过时的 MySQL 版本应返回 false', () => {
+      // 使用一个肯定不存在于版本映射中的版本
+      const supported = isVersionSupported(Engine.MySQL, '8.4.0')
+      assert(!supported, 'MySQL 8.4.0 不应受支持（不在版本映射中）')
+    })
+
+    it('对版本映射中当前的 Redis 版本应返回 true', () => {
+      // 获取 Redis 7 的当前目标版本
+      const targetVersion = getTargetVersion(Engine.Redis, '7')
+      assert(targetVersion !== null, 'Redis 7 应有目标版本')
+      const supported = isVersionSupported(Engine.Redis, targetVersion!)
+      assert(supported, `Redis ${targetVersion} 应受支持`)
+    })
+
+    it('对已过时的 Redis 版本应返回 false', () => {
+      // 使用一个肯定不存在于版本映射中的版本
+      const supported = isVersionSupported(Engine.Redis, '7.0.0')
+      assert(!supported, 'Redis 7.0.0 不应受支持（不在版本映射中）')
     })
   })
 
-  describe('版本比较', () => {
-    it('应该正确比较 PostgreSQL 版本', () => {
-      const v1 = getMajorVersion('17.7.0', Engine.PostgreSQL)
-      const v2 = getMajorVersion('16.4.0', Engine.PostgreSQL)
-      assert(parseInt(v1!) > parseInt(v2!), '17 应该大于 16')
+  describe('isDocumentDBVersionSupported', () => {
+    it('对版本映射中当前的 DocumentDB 版本应返回 true', () => {
+      // 获取 DocumentDB 17 的当前目标版本
+      const targetVersion = getDocumentDBTargetVersion('17')
+      assert(targetVersion !== null, 'DocumentDB 17 应有目标版本')
+      const supported = isDocumentDBVersionSupported(targetVersion!)
+      assert(supported, `DocumentDB ${targetVersion} 应受支持`)
     })
 
-    it('应该正确比较 DocumentDB 版本', () => {
-      const v1 = getMajorVersion('17-0.107.0', Engine.DocumentDB)
-      const v2 = getMajorVersion('16-0.100.0', Engine.DocumentDB)
-      assert(parseInt(v1!) > parseInt(v2!), '17 应该大于 16')
+    it('对已过时的 DocumentDB 版本应返回 false', () => {
+      // 使用一个肯定不存在于版本映射中的版本
+      const supported = isDocumentDBVersionSupported('17-0.1.0')
+      assert(!supported, 'DocumentDB 17-0.1.0 不应受支持（不在版本映射中）')
     })
+  })
+
+  describe('getTargetVersion', () => {
+    it('PostgreSQL 主版本 17 应返回有效的目标版本', () => {
+      const target = getTargetVersion(Engine.PostgreSQL, '17')
+      assert(target !== null, 'PostgreSQL 17 应有目标版本')
+      assert(target!.startsWith('17.'), `目标版本 ${target} 应以 17. 开头`)
+    })
+
+    it('PostgreSQL 主版本 16 应返回有效的目标版本', () => {
+      const target = getTargetVersion(Engine.PostgreSQL, '16')
+      assert(target !== null, 'PostgreSQL 16 应有目标版本')
+      assert(target!.startsWith('16.'), `目标版本 ${target} 应以 16. 开头`)
+    })
+
+    it('MySQL 主版本 8.4 应返回有效的目标版本', () => {
+      const target = getTargetVersion(Engine.MySQL, '8.4')
+      assert(target !== null, 'MySQL 8.4 应有目标版本')
+      assert(target!.startsWith('8.4.'), `目标版本 ${target} 应以 8.4. 开头`)
+    })
+
+    it('MySQL 主版本 8.0 应返回有效的目标版本', () => {
+      const target = getTargetVersion(Engine.MySQL, '8.0')
+      assert(target !== null, 'MySQL 8.0 应有目标版本')
+      assert(target!.startsWith('8.0.'), `目标版本 ${target} 应以 8.0. 开头`)
+    })
+
+    it('Redis 主版本 7 应返回有效的目标版本', () => {
+      const target = getTargetVersion(Engine.Redis, '7')
+      assert(target !== null, 'Redis 7 应有目标版本')
+      assert(target!.startsWith('7.'), `目标版本 ${target} 应以 7. 开头`)
+    })
+
+    it('不支持的主版本应返回 null', () => {
+      const target = getTargetVersion(Engine.PostgreSQL, '12')
+      assertNullish(target, 'PostgreSQL 12 不受支持')
+    })
+  })
+
+  describe('getDocumentDBTargetVersion', () => {
+    it('DocumentDB 主版本 17 应返回有效的目标版本', () => {
+      const target = getDocumentDBTargetVersion('17')
+      assert(target !== null, 'DocumentDB 17 应有目标版本')
+      assert(target!.startsWith('17-'), `目标版本 ${target} 应以 17- 开头`)
+    })
+
+    it('不支持的主版本应返回 null', () => {
+      const target = getDocumentDBTargetVersion('16')
+      assertNullish(target, 'DocumentDB 16 不受支持')
+    })
+  })
+})
+
+describe('测试容器检测模式', () => {
+  // 使用从 core/test-cleanup.ts 导入的 isTestContainer
+  // 来验证生产环境模式是否与预期的测试容器名称匹配
+
+  it('应匹配模式：name-test_<hex>', () => {
+    assert(
+      isTestContainer('duckdb-test_04b0613f'),
+      '应匹配 duckdb-test_04b0613f',
+    )
+    assert(
+      isTestContainer('postgres-test_abcd1234'),
+      '应匹配 postgres-test_abcd1234',
+    )
+    assert(
+      isTestContainer('mysql-test_AABBCC'),
+      '应匹配 mysql-test_AABBCC（不区分大小写）',
+    )
+  })
+
+  it('应匹配模式：name-test-suffix_<hex>', () => {
+    assert(
+      isTestContainer('ferretdb-test-conflict_21e4d447'),
+      '应匹配 ferretdb-test-conflict_21e4d447',
+    )
+    assert(
+      isTestContainer('postgres-test-backup_12345678'),
+      '应匹配 postgres-test-backup_12345678',
+    )
+  })
+
+  it('应匹配模式：name-test-renamed_<hex>', () => {
+    assert(
+      isTestContainer('mysql-test-renamed_1862f018'),
+      '应匹配 mysql-test-renamed_1862f018',
+    )
+    assert(
+      isTestContainer('duckdb-test-renamed-80a8a099'),
+      '应匹配 duckdb-test-renamed-80a8a099',
+    )
+  })
+
+  it('不应匹配常规容器名称', () => {
+    assert(!isTestContainer('myapp'), '不应匹配 myapp')
+    assert(!isTestContainer('production-db'), '不应匹配 production-db')
+    assert(!isTestContainer('test-app'), '不应匹配 test-app（无十六进制后缀）')
+    assert(!isTestContainer('dev-test'), '不应匹配 dev-test（无十六进制后缀）')
+  })
+
+  it('不应匹配过短的十六进制后缀', () => {
+    assert(
+      !isTestContainer('db-test_abc'),
+      '不应匹配 db-test_abc（十六进制太短）',
+    )
+    assert(
+      !isTestContainer('db-test_12345'),
+      '不应匹配 db-test_12345（十六进制太短）',
+    )
   })
 })
